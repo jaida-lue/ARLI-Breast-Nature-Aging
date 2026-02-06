@@ -1,0 +1,16 @@
+senescence-aging-breast-nature-aging/
+│
+├── README.md
+├── analysis/
+│   ├── figure1_nanostring.R
+│   ├── figure2_spatial.R
+│   ├── figure3_sasp.R
+│
+├── functions/
+│   └── helper_functions.R
+│
+├── data/
+│   ├── mock_expression_matrix.csv
+│   ├── mock_metadata.csv
+│
+└── sessionInfo.txt
