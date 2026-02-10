@@ -16,7 +16,7 @@ suppressPackageStartupMessages({
 # ------------------------------------------------------------
 # Paths
 # ------------------------------------------------------------
-OUT_DIR <- "\\\\mfad.mfroot.org\\Researchfl\\Cancer\\D_Radisky-Group\\Jaida Lue\\Multiplex Experiments\\Paper Data\\Paper Resource PM\\Figure 1 Data"
+OUT_DIR <- "<YOUR DATA DIRECTORY>"
 
 ihc_path <- file.path(OUT_DIR, "8N4C IHC results no patient ID Ki67 Top2a and acini number.xlsx")
 dasl_path <- file.path(OUT_DIR, "DASL data.xlsx")
@@ -68,7 +68,7 @@ t_top2a <- cluster_t_test("Top2A", "group", "Block")
 t_ki67 <- cluster_t_test("Ki67", "group", "Block")
 
 # ------------------------------------------------------------
-# Nature Aging style theme
+# Plot style theme
 # ------------------------------------------------------------
 theme_nature <- theme_minimal(base_size = 14, base_family = "sans") +
   theme(
@@ -122,8 +122,8 @@ p_ki67_top2a <- ggplot(ihc, aes(x = Ki67, y = Top2A, color = group)) +
 # ------------------------------------------------------------
 highlight_genes <- c("TOP2A","CDCA3","UBE2C","MAD2L1","KIF11","CDCA8","MCM7","TYMS","KIF18B")
 
-complete_ids <- c("907159","2132227","4228571","883679")
-noninv_ids   <- c("2464121","2385170","2138210","3725329","2315552","2841570","2683947","2392990")
+complete_ids <- c("P1","P2","P3","P4")
+noninv_ids   <- c("P5","P6","P7","P8","P9","P10","P11","P12")
 
 volcano_df <- dasl %>%
   rowwise() %>%
@@ -179,13 +179,9 @@ fig1d <- ggplot(prolif_index, aes(x = group, y = proliferation_index, color = gr
   theme_nature
 
 # ------------------------------------------------------------
-# Export all figures as high-quality TIFF
+# Export all figures
 # ------------------------------------------------------------
 plots_list <- list(p_acini, p_top2a, p_ki67, p_ki67_top2a, volcano_plot, fig1c, fig1d)
 names(plots_list) <- c("Acini","Top2A","Ki67","Ki67_vs_Top2A","Volcano_DASL","PCA","Proliferation_Index")
 
-for(name in names(plots_list)){
-  ggsave(file.path(OUT_DIR, paste0(name,".tiff")), plot = plots_list[[name]], width = 6, height = 5, dpi = 600, compression = "lzw")
-}
 
-cat("\n✓ All figures formatted and saved for Nature Aging.\n")
