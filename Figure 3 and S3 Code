@@ -1,0 +1,691 @@
+# ============================================================================
+# Figure 3 — Data Loading & Preparation
+# ============================================================================
+#
+# Description:
+#   Loads and prepares spatial nearest-neighbor (NN) and tissue density data
+#   from two independent multiplex immunofluorescence cohorts:
+#     1. Initial Biopsy cohort  (n = 14 patients after exclusions)
+#     2. Subsequent cohort      (n = 14 patients after exclusions)
+#
+#   Each cohort undergoes the same pipeline:
+#     - Load nearest-neighbor cell-level data
+#     - Extract and harmonize patient IDs from annotation identifiers
+#     - Remove excluded patients (QC failures / insufficient tissue)
+#     - Merge clinical pace metrics (involution status, menopause proximity)
+#     - Build a tissue density lookup table from cell_seg_summary files
+#     - Validate annotation-level concordance between NN and density tables
+#
+# Inputs (place in DATA_DIR):
+#   - initial_biopsy_NN_data.txt          Tab-delimited NN export
+#   - subsequent_NN_data.txt              Tab-delimited NN export
+#   - initial_biopsy_cell_seg_summary.txt Cell seg summary (initial biopsy)
+#   - subsequent_cell_seg_summary.txt     Cell seg summary (subsequent)
+#   - pace_metrics_initial_biopsy.xlsx    Clinical metadata (initial biopsy)
+#   - pace_metrics_subsequent.xlsx        Clinical metadata (subsequent)
+#
+# Outputs (in-memory data frames):
+#   - initial_nn_data     Cleaned NN data with pace metrics (initial biopsy)
+#   - subsequent_nn_data  Cleaned NN data with pace metrics (subsequent)
+#   - initial_density     Tissue area lookup table (initial biopsy)
+#   - subsequent_density  Tissue area lookup table (subsequent)
+#
+# Dependencies:
+#   dplyr, stringr, readxl, tidyr, readr, dbscan, sandwich, lmtest,
+#   ggplot2, patchwork, scales
+# ============================================================================
+
+
+# ============================================================================
+# 0.  SETUP — Load packages (de-duplicated)
+# ============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(readr)
+  library(readxl)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+  library(dbscan)
+  library(sandwich)
+  library(lmtest)
+})
+
+
+# ============================================================================
+# 1.  FILE PATHS
+# ============================================================================
+# Update DATA_DIR to point to your local data folder.
+# All input files should use de-identified patient labels.
+
+DATA_DIR <- "data"
+OUT_DIR  <- "output"
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+# --- Initial Biopsy cohort ---
+initial_nn_path      <- file.path(DATA_DIR, "initial_biopsy_NN_data.txt")
+initial_summary_path <- file.path(DATA_DIR, "initial_biopsy_cell_seg_summary.txt")
+initial_pace_path    <- file.path(DATA_DIR, "pace_metrics_initial_biopsy.xlsx")
+
+# --- Subsequent cohort ---
+subsequent_nn_path      <- file.path(DATA_DIR, "subsequent_NN_data.txt")
+subsequent_summary_path <- file.path(DATA_DIR, "subsequent_cell_seg_summary.txt")
+subsequent_pace_path    <- file.path(DATA_DIR, "pace_metrics_subsequent.xlsx")
+
+# --- Patients to exclude (QC failures / insufficient tissue) ---
+initial_exclude    <- c("C31183", "C38385")
+subsequent_exclude <- c("MR93-9145", "C5533-81")
+
+# Expected patient count per cohort after exclusions
+EXPECTED_N <- 14
+
+
+# ============================================================================
+# 2.  HELPER FUNCTIONS
+# ============================================================================
+
+#' Extract patient ID from an Annotation ID string
+#'
+#' Annotation IDs follow the pattern: {P|S}_{PatientID}_{rest}
+#' This function extracts the alphanumeric patient ID segment and applies
+#' manual corrections for truncated IDs.
+#'
+#' @param annotation_ids Character vector of Annotation ID strings.
+#' @return Character vector of cleaned patient IDs.
+extract_patient_id <- function(annotation_ids) {
+  # Step 1: Extract the alphanumeric block immediately after the P_ or S_ prefix
+  ids <- str_extract(annotation_ids, "(?<=^[PS]_)[A-Z0-9]+")
+
+  # Step 2: Correct known truncated IDs
+  #   "CR02" should be "CR02165"; "MR93" should be "MR931544"
+  ids <- case_when(
+    ids == "CR02" ~ "CR02165",
+    ids == "MR93" ~ "MR931544",
+    TRUE          ~ ids
+  )
+
+  return(ids)
+}
+
+
+#' Build a tissue density lookup table from a cell_seg_summary data frame
+#'
+#' Extracts unique combinations of annotation, slide, tissue category, and
+#' area. The area column is kept in square microns (original InForm units).
+#'
+#' @param seg_summary Data frame read from a cell_seg_data_summary.txt file.
+#' @return Tibble with columns: Annotation_ID, Slide_ID, Tissue_Category,
+#'         Tissue_Area_um2, Patient_ID.
+build_density_table <- function(seg_summary) {
+  seg_summary %>%
+    select(
+      Annotation.ID,
+      Slide.ID,
+      Tissue.Category,
+      Tissue.Category.Area..square.microns.
+    ) %>%
+    distinct() %>%
+    transmute(
+      Annotation_ID   = Annotation.ID,
+      Slide_ID        = Slide.ID,
+      Tissue_Category = str_trim(Tissue.Category),
+      Tissue_Area_um2 = Tissue.Category.Area..square.microns.
+    ) %>%
+    arrange(Annotation_ID, Tissue_Category)
+}
+
+
+# ============================================================================
+# 3.  LOAD & PREPARE — Subsequent Cohort (NN Data)
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Loading Subsequent Cohort NN Data\n")
+cat("========================================\n")
+
+# 3a. Read tab-delimited nearest-neighbor export
+subsequent_nn_data <- read.table(
+  subsequent_nn_path,
+  header        = TRUE,
+  sep           = "\t",
+  quote         = "",
+  check.names   = FALSE,
+  fill          = TRUE,
+  comment.char  = "",
+  row.names     = NULL
+)
+
+# 3b. Extract patient IDs from Annotation ID column
+subsequent_nn_data <- subsequent_nn_data %>%
+  mutate(Patient_ID = extract_patient_id(`Annotation ID`))
+
+# 3c. Remove excluded patients (insufficient tissue quality)
+subsequent_nn_data <- subsequent_nn_data %>%
+  filter(!str_detect(`Annotation ID`, paste(subsequent_exclude, collapse = "|")))
+
+# 3d. Validate expected patient count
+cat("  Unique patients after exclusions:", n_distinct(subsequent_nn_data$Patient_ID), "\n")
+stopifnot(n_distinct(subsequent_nn_data$Patient_ID) == EXPECTED_N)
+
+# 3e. Merge clinical pace metrics (involution status, menopause proximity, etc.)
+pace_metrics_subsequent <- read_excel(subsequent_pace_path)
+
+subsequent_nn_data <- subsequent_nn_data %>%
+  left_join(pace_metrics_subsequent, by = "Patient_ID")
+
+cat("  Columns after pace merge:", ncol(subsequent_nn_data), "\n")
+cat("  Total rows:", nrow(subsequent_nn_data), "\n")
+
+
+# ============================================================================
+# 4.  LOAD & PREPARE — Subsequent Cohort (Density Table)
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Building Subsequent Density Table\n")
+cat("========================================\n")
+
+# 4a. Read cell_seg_summary file
+subsequent_seg_summary <- read.delim(subsequent_summary_path, stringsAsFactors = FALSE)
+
+# 4b. Build density table and add patient IDs
+subsequent_density <- build_density_table(subsequent_seg_summary) %>%
+  mutate(Patient_ID = extract_patient_id(Annotation_ID))
+
+# 4c. Remove excluded patients
+subsequent_density <- subsequent_density %>%
+  filter(!str_detect(Annotation_ID, paste(subsequent_exclude, collapse = "|")))
+
+# 4d. Validate patient count
+cat("  Unique patients:", n_distinct(subsequent_density$Patient_ID), "\n")
+stopifnot(n_distinct(subsequent_density$Patient_ID) == EXPECTED_N)
+
+# 4e. Cross-check: every density Annotation ID must exist in NN data
+missing_ids <- setdiff(
+  subsequent_density$Annotation_ID,
+  subsequent_nn_data$`Annotation ID`
+)
+
+if (length(missing_ids) > 0) {
+  stop("Annotation IDs in Subsequent Density missing from NN data: ",
+       paste(missing_ids, collapse = ", "))
+} else {
+  cat("  \u2713 All density Annotation IDs found in NN data\n")
+}
+
+
+# ============================================================================
+# 5.  LOAD & PREPARE — Initial Biopsy Cohort (NN Data)
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Loading Initial Biopsy Cohort NN Data\n")
+cat("========================================\n")
+
+# 5a. Read tab-delimited nearest-neighbor export
+initial_nn_data <- read.table(
+  initial_nn_path,
+  header        = TRUE,
+  sep           = "\t",
+  quote         = "",
+  check.names   = FALSE,
+  fill          = TRUE,
+  comment.char  = "",
+  row.names     = NULL
+)
+
+# 5b. Extract patient IDs from Annotation ID column
+initial_nn_data <- initial_nn_data %>%
+  mutate(Patient_ID = extract_patient_id(`Annotation ID`))
+
+cat("  Unique patients after extraction:", n_distinct(initial_nn_data$Patient_ID), "\n")
+
+# 5c. Merge clinical pace metrics (involution status, menopause proximity, etc.)
+pace_metrics_initial <- read_excel(initial_pace_path)
+
+initial_nn_data <- initial_nn_data %>%
+  left_join(pace_metrics_initial, by = "Patient_ID")
+
+# 5d. Remove excluded patients (QC failures)
+initial_nn_data <- initial_nn_data %>%
+  filter(!Patient_ID %in% initial_exclude)
+
+# 5e. Validate: excluded patients are fully removed and count is correct
+stopifnot(!any(initial_nn_data$Patient_ID %in% initial_exclude))
+stopifnot(n_distinct(initial_nn_data$Patient_ID) == EXPECTED_N)
+
+cat("  Final unique patients:", n_distinct(initial_nn_data$Patient_ID), "\n")
+cat("  Final unique annotations:", n_distinct(initial_nn_data$`Annotation ID`), "\n")
+
+
+# ============================================================================
+# 6.  LOAD & PREPARE — Initial Biopsy Cohort (Density Table)
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Building Initial Biopsy Density Table\n")
+cat("========================================\n")
+
+# 6a. Read cell_seg_summary file
+initial_seg_summary <- read.delim(initial_summary_path, stringsAsFactors = FALSE)
+cat("  Raw cell_seg_summary rows:", nrow(initial_seg_summary), "\n")
+
+# 6b. Build density table and add patient IDs
+initial_density <- build_density_table(initial_seg_summary) %>%
+  mutate(Patient_ID = extract_patient_id(Annotation_ID))
+
+# 6c. Remove excluded patients
+initial_density <- initial_density %>%
+  filter(!Patient_ID %in% initial_exclude)
+
+# 6d. Validate patient count
+cat("  Unique patients:", n_distinct(initial_density$Patient_ID), "\n")
+stopifnot(n_distinct(initial_density$Patient_ID) == EXPECTED_N)
+
+cat("  \u2713 Initial Biopsy density table complete\n")
+
+
+# ============================================================================
+# 7.  SUMMARY — Confirm all four data frames are ready
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Data Preparation Complete\n")
+cat("========================================\n\n")
+
+cat(sprintf("  %-30s %6d rows  |  %2d patients  |  %3d annotations\n",
+            "initial_nn_data",
+            nrow(initial_nn_data),
+            n_distinct(initial_nn_data$Patient_ID),
+            n_distinct(initial_nn_data$`Annotation ID`)))
+
+cat(sprintf("  %-30s %6d rows  |  %2d patients\n",
+            "initial_density",
+            nrow(initial_density),
+            n_distinct(initial_density$Patient_ID)))
+
+cat(sprintf("  %-30s %6d rows  |  %2d patients  |  %3d annotations\n",
+            "subsequent_nn_data",
+            nrow(subsequent_nn_data),
+            n_distinct(subsequent_nn_data$Patient_ID),
+            n_distinct(subsequent_nn_data$`Annotation ID`)))
+
+cat(sprintf("  %-30s %6d rows  |  %2d patients\n",
+            "subsequent_density",
+            nrow(subsequent_density),
+            n_distinct(subsequent_density$Patient_ID)))
+
+cat("\nAll four data frames are loaded and validated.\n")
+cat("Proceed to Figure 3 plotting script.\n")
+
+# ============================================================================
+# Figure 3C–F — Paired Biopsy Comparison (Initial vs Subsequent)
+# ============================================================================
+#
+# Description:
+#   This script links the Initial Biopsy and Subsequent cohorts at the
+#   individual level using de-identified Woman IDs (W01–W14), computes four
+#   lobule-level morphometric summaries per woman per timepoint, and generates
+#   paired spaghetti plots (Figures 3C–F) with Wilcoxon signed-rank tests.
+#
+# Prerequisite:
+#   Run "Figure3_data_preparation.R" first. This script expects the following
+#   data frames in the environment:
+#     - initial_nn_data      (NN data, initial biopsy cohort)
+#     - initial_density      (density table, initial biopsy cohort)
+#     - subsequent_nn_data   (NN data, subsequent cohort)
+#     - subsequent_density   (density table, subsequent cohort)
+#
+# Figures produced:
+#   Fig 3C — Epithelial area (mm²) per lobule, paired by woman
+#   Fig 3D — Median epithelial cell count per lobule, paired by woman
+#   Fig 3E — Median CK⁺ cell distance to epithelial edge (µm), paired
+#   Fig 3F — Relative IQR of epithelial area per lobule, paired
+#
+# Outputs (saved to OUT_DIR):
+#   - paired_biopsy_comparison_data.csv   Wide-format paired metrics
+#   - paired_biopsy_wilcox_results.csv    Wilcoxon test results
+# ============================================================================
+
+
+# ============================================================================
+# 1.  PATIENT MAPPING — Link Initial Biopsy ↔ Subsequent by Woman
+# ============================================================================
+# Each row pairs one woman's Initial Biopsy patient ID with her Subsequent
+# patient ID. Woman_ID (W01–W14) serves as the de-identified longitudinal
+# identifier used in all downstream analyses and figures.
+#
+# NOTE: The original patient IDs below are internal to the multiplex imaging
+# pipeline. They do not contain PHI and are used solely to link across batches.
+# If full de-identification is required, replace both columns with opaque
+# tokens and update the NN/density data accordingly.
+
+patient_mapping <- tibble::tribble(
+  ~Initial_ID,  ~Subsequent_ID,
+  "MR97",       "CR02165",
+
+  "C24103",     "C7694",
+  "C9606",      "MR931544",
+  "C2089",      "C34380",
+  "C26582",     "C17362",
+  "M6930",      "M3652",
+  "C2675",      "C23108",
+  "C24737",     "MR96",
+  "C23158",     "CR92",
+  "CR93",       "MR97",
+  "C25337",     "C19955",
+  "M31644",     "XR96",
+  "C5222",      "C10110",
+  "M11474",     "CR93"
+) %>%
+  mutate(Woman_ID = paste0("W", sprintf("%02d", row_number())))
+
+
+# ============================================================================
+# 2.  ATTACH Woman_ID TO ALL DATA FRAMES
+# ============================================================================
+# Join the mapping table to each data frame so every row carries the
+# de-identified Woman_ID for downstream pairing.
+
+attach_woman_id <- function(df, id_col, map_col) {
+  #' @param df        Data frame containing a Patient_ID column.
+ #' @param id_col    Name of the Patient_ID column in df.
+  #' @param map_col   Name of the corresponding column in patient_mapping
+  #'                  ("Initial_ID" or "Subsequent_ID").
+  #' @return df with Woman_ID attached; mapping helper columns removed.
+  df %>%
+    left_join(patient_mapping, by = setNames(map_col, id_col),
+              suffix = c("", "_map")) %>%
+    select(-any_of(c("Initial_ID", "Subsequent_ID")))
+}
+
+# Attach to all four data frames
+initial_nn_data      <- attach_woman_id(initial_nn_data,     "Patient_ID", "Initial_ID")
+initial_density      <- attach_woman_id(initial_density,     "Patient_ID", "Initial_ID")
+subsequent_nn_data   <- attach_woman_id(subsequent_nn_data,  "Patient_ID", "Subsequent_ID")
+subsequent_density   <- attach_woman_id(subsequent_density,  "Patient_ID", "Subsequent_ID")
+
+# Validate: every row should have a non-NA Woman_ID
+stopifnot(
+  all(!is.na(initial_nn_data$Woman_ID)),
+  all(!is.na(initial_density$Woman_ID)),
+  all(!is.na(subsequent_nn_data$Woman_ID)),
+  all(!is.na(subsequent_density$Woman_ID))
+)
+
+cat("\u2713 Woman_ID successfully attached to all four datasets\n")
+
+
+# ============================================================================
+# 3.  METRIC FUNCTIONS — Compute per-woman lobule summaries
+# ============================================================================
+# Each function takes an NN or density data frame (with Woman_ID) and returns
+# a one-row-per-woman tibble of the relevant morphometric summary.
+
+#' Median epithelial tissue area (mm²) per lobule per woman
+#' Source: density table (tissue area in µm², converted to mm²)
+calc_epithelial_area <- function(density_df) {
+  density_df %>%
+    filter(Tissue_Category == "Epithelial") %>%
+    group_by(Woman_ID, Annotation_ID) %>%
+    summarise(epi_area_mm2 = sum(Tissue_Area_um2, na.rm = TRUE) / 1e6,
+              .groups = "drop") %>%
+    group_by(Woman_ID) %>%
+    summarise(epi_area_mm2 = median(epi_area_mm2, na.rm = TRUE),
+              .groups = "drop")
+}
+
+#' Median total epithelial cell count per lobule per woman
+#' Source: NN data (one row per cell; count epithelial-category cells)
+calc_epithelial_count <- function(nn_df) {
+  nn_df %>%
+    filter(`Tissue Category` == "Epithelial") %>%
+    group_by(Woman_ID, `Annotation ID`) %>%
+    summarise(n_epi = n(), .groups = "drop") %>%
+    group_by(Woman_ID) %>%
+    summarise(median_epi_count = median(n_epi, na.rm = TRUE),
+              .groups = "drop")
+}
+
+#' Median distance of CK⁺ epithelial cells to the epithelial tissue edge (µm)
+#' Source: NN data (filtered to CK+ phenotype within epithelial compartment)
+calc_ck_distance <- function(nn_df) {
+  nn_df %>%
+    filter(`Phenotype CK` == "CK+",
+           `Tissue Category` == "Epithelial") %>%
+    group_by(Woman_ID) %>%
+    summarise(
+      median_CKdist = median(
+        as.numeric(`Distance from Tissue Category Edge (microns)`),
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+}
+
+#' Relative IQR of epithelial area across lobules per woman
+#' Measures within-woman variability in lobule size (IQR / median).
+#' Source: density table
+calc_relative_iqr <- function(density_df) {
+  density_df %>%
+    filter(Tissue_Category == "Epithelial") %>%
+    group_by(Woman_ID) %>%
+    summarise(
+      rel_IQR = IQR(Tissue_Area_um2, na.rm = TRUE) /
+                median(Tissue_Area_um2, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+
+# ============================================================================
+# 4.  COMPUTE SUMMARIES — One table per timepoint
+# ============================================================================
+
+# --- Initial Biopsy summary (one row per woman) ---
+initial_summary <- calc_epithelial_area(initial_density) %>%
+  left_join(calc_epithelial_count(initial_nn_data),  by = "Woman_ID") %>%
+  left_join(calc_ck_distance(initial_nn_data),       by = "Woman_ID") %>%
+  left_join(calc_relative_iqr(initial_density),      by = "Woman_ID") %>%
+  rename_with(~ paste0(.x, "_initial"), -Woman_ID)
+
+# --- Subsequent summary (one row per woman) ---
+subsequent_summary <- calc_epithelial_area(subsequent_density) %>%
+  left_join(calc_epithelial_count(subsequent_nn_data),  by = "Woman_ID") %>%
+  left_join(calc_ck_distance(subsequent_nn_data),       by = "Woman_ID") %>%
+  left_join(calc_relative_iqr(subsequent_density),      by = "Woman_ID") %>%
+  rename_with(~ paste0(.x, "_subsequent"), -Woman_ID)
+
+
+# ============================================================================
+# 5.  BUILD PAIRED COMPARISON TABLE
+# ============================================================================
+# Inner join ensures only women present in both cohorts are included.
+
+paired_comparison <- initial_summary %>%
+  inner_join(subsequent_summary, by = "Woman_ID")
+
+cat("\n=== Paired Comparison Table ===\n")
+cat("Women with paired data:", nrow(paired_comparison), "\n")
+print(paired_comparison)
+
+
+# ============================================================================
+# 6.  WILCOXON SIGNED-RANK TESTS (Paired, two-sided)
+# ============================================================================
+# Non-parametric paired test appropriate for n = 14 matched observations.
+# exact = FALSE uses a normal approximation (avoids warnings with ties).
+
+wilcox_results <- tibble(
+  metric = c(
+    "Epithelial area (mm\u00B2)",
+    "Median epithelial cell count",
+    "Median CK\u207A distance (\u00B5m)",
+    "Relative IQR epithelial area"
+  ),
+  initial_col    = c("epi_area_mm2_initial",  "median_epi_count_initial",
+                     "median_CKdist_initial",  "rel_IQR_initial"),
+  subsequent_col = c("epi_area_mm2_subsequent", "median_epi_count_subsequent",
+                     "median_CKdist_subsequent", "rel_IQR_subsequent"),
+  p_value = mapply(
+    function(init, subseq) {
+      wilcox.test(
+        paired_comparison[[init]],
+        paired_comparison[[subseq]],
+        paired = TRUE,
+        exact  = FALSE
+      )$p.value
+    },
+    c("epi_area_mm2_initial",  "median_epi_count_initial",
+      "median_CKdist_initial",  "rel_IQR_initial"),
+    c("epi_area_mm2_subsequent", "median_epi_count_subsequent",
+      "median_CKdist_subsequent", "rel_IQR_subsequent")
+  )
+) %>%
+  select(metric, p_value)
+
+cat("\n=== Wilcoxon Signed-Rank Test Results ===\n")
+print(wilcox_results)
+
+# Save results
+write_csv(wilcox_results,    file.path(OUT_DIR, "paired_biopsy_wilcox_results.csv"))
+write_csv(paired_comparison, file.path(OUT_DIR, "paired_biopsy_comparison_data.csv"))
+
+
+# ============================================================================
+# 7.  RESHAPE TO LONG FORMAT (for plotting)
+# ============================================================================
+# Pivot so each row is one woman × one metric × one timepoint.
+
+long_df <- paired_comparison %>%
+  pivot_longer(
+    cols      = -Woman_ID,
+    names_to  = c("Metric", "Timepoint"),
+    names_pattern = "(.*)_(initial|subsequent)",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Timepoint = factor(
+      Timepoint,
+      levels = c("initial", "subsequent"),
+      labels = c("Initial Biopsy", "Subsequent Biopsy")
+    )
+  )
+
+
+# ============================================================================
+# 8.  PLOT AESTHETICS — Shared palette and spaghetti plot function
+# ============================================================================
+
+text_color     <- "black"
+grid_color     <- "#E8E8E8"
+accent_color   <- "#34495E"
+line_color     <- "#7F8C8D"
+point_initial  <- "#27AE60"   # Green  — Initial Biopsy
+point_followup <- "#E74C3C"   # Red    — Subsequent Biopsy
+
+#' Generate a paired spaghetti plot for one morphometric metric.
+#'
+#' Each line connects the same woman across the two timepoints.
+#' Points are colored by timepoint; Wilcoxon p-value is in the subtitle.
+#'
+#' @param df          Long-format data frame with columns:
+#'                    Woman_ID, Metric, Timepoint, Value.
+#' @param metric_name Internal metric name (matches Metric column).
+#' @param ylab        Y-axis label (also used as plot title).
+#' @param p_val       Numeric p-value for the subtitle.
+#' @param caption     Brief description shown as plot caption.
+#' @return A ggplot object.
+plot_paired_spaghetti <- function(df, metric_name, ylab, p_val, caption) {
+
+  plot_data <- df %>% filter(Metric == metric_name)
+
+  ggplot(plot_data, aes(x = Timepoint, y = Value, group = Woman_ID)) +
+    # Connecting lines (one per woman)
+    geom_line(color = line_color, linewidth = 1.8, alpha = 0.35) +
+    # Timepoint-colored points
+    geom_point(aes(color = Timepoint), size = 5, alpha = 0.85, stroke = 0.5) +
+    scale_color_manual(
+      values = c("Initial Biopsy"    = point_initial,
+                 "Subsequent Biopsy" = point_followup),
+      guide  = "none"
+    ) +
+    scale_y_continuous(
+      breaks = pretty_breaks(n = 7),
+      expand = expansion(mult = 0.08)
+    ) +
+    labs(
+      x        = "",
+      y        = ylab,
+      title    = ylab,
+      subtitle = sprintf("Paired Wilcoxon test: p = %.2f", p_val),
+      caption  = caption
+    ) +
+    theme_minimal(base_size = 16) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 28, hjust = 0.5),
+      plot.subtitle = element_text(size = 28, hjust = 0.5),
+      axis.title.y  = element_text(face = "bold", size = 28),
+      axis.text.x   = element_text(size = 26, face = "bold"),
+      axis.text.y   = element_text(size = 24),
+      panel.border  = element_rect(color = accent_color, fill = NA),
+      panel.grid.major.y = element_line(color = grid_color),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor   = element_blank(),
+      panel.background   = element_rect(fill = "white", color = NA),
+      plot.background    = element_rect(fill = "white", color = NA),
+      plot.margin        = margin(10, 10, 10, 10)
+    )
+}
+
+
+# ============================================================================
+# 9.  GENERATE FIGURES 3C–F
+# ============================================================================
+
+# --- Fig 3C: Epithelial area per lobule ---
+fig3c <- plot_paired_spaghetti(
+  long_df,
+  metric_name = "epi_area_mm2",
+  ylab        = "Epithelial Area (mm\u00B2)",
+  p_val       = wilcox_results$p_value[1],
+  caption     = "Median epithelial tissue area per lobule (mm\u00B2) per woman."
+)
+
+# --- Fig 3D: Epithelial cell count per lobule ---
+fig3d <- plot_paired_spaghetti(
+  long_df,
+  metric_name = "median_epi_count",
+  ylab        = "Median Epithelial Cell Count",
+  p_val       = wilcox_results$p_value[2],
+  caption     = "Median total epithelial cell count per lobule per woman."
+)
+
+# --- Fig 3E: CK⁺ distance to epithelial edge ---
+fig3e <- plot_paired_spaghetti(
+  long_df,
+  metric_name = "median_CKdist",
+  ylab        = "Median CK\u207A Distance to\nEpithelial Edge (\u00B5m)",
+  p_val       = wilcox_results$p_value[3],
+  caption     = "Median distance of CK\u207A epithelial cells to the epithelial boundary (\u00B5m)."
+)
+
+# --- Fig 3F: Relative IQR of epithelial area ---
+fig3f <- plot_paired_spaghetti(
+  long_df,
+  metric_name = "rel_IQR",
+  ylab        = "Relative IQR of Epithelial Area",
+  p_val       = wilcox_results$p_value[4],
+  caption     = "Relative variability (IQR/median) of epithelial area per lobule per woman."
+)
+
+# Print all panels
+print(fig3c)
+print(fig3d)
+print(fig3e)
+print(fig3f)
+
+cat("\n\u2713 Figures 3C\u2013F generated successfully.\n")
