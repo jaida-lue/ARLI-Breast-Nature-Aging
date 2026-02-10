@@ -1,0 +1,1488 @@
+# ==============================================================================
+# FIGURE 2: Spatial Analysis of Post-Menopausal Breast Tissue
+# ==============================================================================
+# This script generates all panels for Figure 2, analyzing multiplex
+# immunofluorescence data comparing Non-Involuted vs Fully Involuted
+# post-menopausal breast tissue. Panels include:
+#   2C-D: Spatial density profiles (example ROIs)
+#   2E-I: Violin plots of cell densities by involution group
+#   2K:   p16→p16 self-clustering (CSR excess)
+#   2L-M: p16→CD45 and Top2A→CD45 contact fractions
+#   2N:   Top2A→CD45 CSR excess (halo depletion)
+#   2O:   CD45→Top2A CSR excess
+# ==============================================================================
+
+
+# ==============================================================================
+# SECTION 1: LOAD LIBRARIES
+# ==============================================================================
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(scales)
+library(grid)
+library(gridExtra)
+library(tidyr)
+library(purrr)
+library(cowplot)
+library(patchwork)
+library(sandwich)    # Cluster-robust standard errors
+library(lmtest)      # Coefficient testing with robust SEs
+
+
+# ==============================================================================
+# SECTION 2: SHARED UTILITIES
+# ==============================================================================
+# Define reusable functions and constants used across multiple figure panels.
+# This eliminates code duplication for smoothing, bootstrapping, theming, etc.
+
+# --- 2.1: Global Constants ---
+BIN_WIDTH   <- 25       # Spatial bin width in µm for density histograms
+SIGMA_BINS  <- 1.5      # Gaussian kernel width in bin units
+RADII       <- c(5, 10, 15, 20, 25, 30)  # Radii (µm) for proximity analyses
+N_BOOT      <- 1000     # Number of bootstrap iterations for CIs
+SEED        <- 123      # Reproducibility seed for bootstrapping
+
+# --- 2.2: Group Color Palettes ---
+# Consistent colors across all proximity/CSR plots
+group_colors <- c(
+  "Non-Involuted"  = "#0072B2",   # Blue
+  "Fully Involuted" = "#D55E00"   # Orange/Red
+)
+
+# Phenotype-specific colors for spatial density line plots (Figs 2C-D)
+phenotype_colors <- c(
+  "p16+ (Senescent)"      = "#FDD835",   # Yellow
+  "Ki67+ (Proliferating)" = "#1976D2",   # Blue
+  "Top2A+ (Proliferating)" = "#9E9E9E",  # Gray
+  "CD45+ (Immune)"         = "#4CAF50"   # Green
+)
+
+# Violin fill colors - each phenotype gets its own color family with group shading
+violin_colors <- list(
+  area  = c("Fully Involuted" = "#E57373", "Non-Involuted" = "#D32F2F"),
+  p16   = c("Fully Involuted" = "#F9A825", "Non-Involuted" = "#FDD835"),
+  ki67  = c("Fully Involuted" = "#0D47A1", "Non-Involuted" = "#1E88E5"),
+  top2a = c("Fully Involuted" = "#F5F5F5", "Non-Involuted" = "#757575"),
+  cd45  = c("Fully Involuted" = "#A5D6A7", "Non-Involuted" = "#4CAF50")
+)
+
+# --- 2.3: Shared Publication Theme ---
+# Base theme applied to all plots; individual panels override as needed
+pub_theme_base <- theme_classic(base_size = 16, base_family = "sans") +
+  theme(
+    plot.title       = element_text(face = "bold", size = 32, hjust = 0.5,
+                                    margin = margin(b = 15)),
+    axis.title.x     = element_text(face = "bold", size = 28, margin = margin(t = 12)),
+    axis.title.y     = element_text(face = "bold", size = 28, margin = margin(r = 12)),
+    axis.text.x      = element_text(size = 26, color = "black"),
+    axis.text.y      = element_text(size = 26, color = "black"),
+    axis.line        = element_line(color = "black", linewidth = 1),
+    axis.ticks       = element_line(color = "black", linewidth = 0.8),
+    axis.ticks.length = unit(0.2, "cm"),
+    legend.position  = "top",
+    legend.text      = element_text(size = 28),
+    legend.key.size  = unit(1.2, "cm"),
+    legend.spacing.x = unit(0.5, "cm"),
+    legend.box.spacing = unit(0.8, "cm"),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    plot.margin      = margin(20, 25, 20, 20)
+  )
+
+# Violin-specific theme (slightly different sizing for multi-panel layout)
+pub_theme_violin <- theme_classic(base_size = 18) +
+  theme(
+    plot.title       = element_text(size = 28, face = "bold", hjust = 0.5,
+                                    margin = margin(b = 8)),
+    plot.subtitle    = element_text(size = 22, hjust = 0.5, color = "grey20",
+                                    margin = margin(b = 12)),
+    axis.title       = element_text(size = 20, face = "bold"),
+    axis.title.y     = element_text(margin = margin(r = 12)),
+    axis.title.x     = element_text(margin = margin(t = 12)),
+    axis.text        = element_text(size = 20, color = "black"),
+    axis.text.x      = element_text(size = 20, face = "bold"),
+    axis.line        = element_line(linewidth = 1.2, lineend = "square"),
+    axis.ticks       = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(0.25, "cm"),
+    legend.position  = "none",
+    plot.margin      = margin(20, 20, 20, 20),
+    panel.grid.major.y = element_line(color = "grey92", linewidth = 0.4),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA)
+  )
+
+# Spatial density line plot theme (Figs 2C-D)
+pub_theme_density <- theme_classic(base_size = 16) +
+  theme(
+    plot.subtitle    = element_text(size = 26, color = "grey30", hjust = 0),
+    axis.title       = element_text(size = 32, face = "bold"),
+    axis.text        = element_text(size = 24, color = "black"),
+    legend.position  = "right",
+    legend.title     = element_text(size = 26, face = "bold"),
+    legend.text      = element_text(size = 22),
+    legend.background = element_rect(fill = "white", color = "grey80", linewidth = 0.5),
+    legend.key.height = unit(1, "cm"),
+    legend.box       = "vertical",
+    legend.spacing.y = unit(0.3, "cm"),
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+    axis.line        = element_line(linewidth = 1),
+    axis.ticks       = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(0.2, "cm"),
+    plot.margin      = margin(15, 15, 15, 15)
+  )
+
+# --- 2.4: Gaussian Smoother with Reflected Edges ---
+# Smooths binned cell counts using a Gaussian kernel.
+# Edge reflection prevents boundary artifacts in the smoothed curve.
+# Args:
+#   x          - numeric vector of bin counts
+#   sigma_bins - kernel width in bin units (default 1.5)
+#   truncate   - kernel truncation in multiples of sigma (default 4)
+gaussian_smooth_reflect <- function(x, sigma_bins = SIGMA_BINS, truncate = 4) {
+  n <- length(x)
+  if (n <= 1) return(x)
+
+  # Build discrete Gaussian kernel
+
+  k      <- ceiling(truncate * sigma_bins)
+  kernel <- dnorm(-k:k, mean = 0, sd = sigma_bins)
+  kernel <- kernel / sum(kernel)
+
+  # Reflect edges to avoid boundary drop-off
+
+  pad   <- min(k, n - 1)
+  x_pad <- c(rev(x[1:pad]), x, rev(x[(n - pad + 1):n]))
+
+  # Convolve and extract the original-length segment
+  y_pad <- stats::filter(x_pad, kernel, sides = 2, method = "convolution")
+  y     <- y_pad[(pad + 1):(pad + n)]
+  y[is.na(y)] <- 0
+  as.numeric(y)
+}
+
+# --- 2.5: Smoothed Density Data Frame Builder ---
+# Bins cell positions, applies Gaussian smoothing, and optionally normalizes.
+# Used in Figs 2C-D to create the spatial density curves.
+# Args:
+#   cells     - data frame with column x_aligned (cell X positions)
+#   label     - character string for phenotype label
+#   x_bins    - numeric vector of bin break points
+#   normalize - if TRUE, normalize so densities sum to 1
+make_smoothed_density <- function(cells, label, x_bins, normalize = TRUE) {
+  x_mids <- head(x_bins, -1) + diff(x_bins[1:2]) / 2
+  h       <- hist(cells$x_aligned, breaks = x_bins, plot = FALSE,
+                  right = FALSE, include.lowest = TRUE)
+  y_sm    <- gaussian_smooth_reflect(h$counts)
+  if (normalize) y_sm <- y_sm / sum(y_sm)
+
+  tibble(x = x_mids, y = y_sm, phenotype = label, n = nrow(cells))
+}
+
+# --- 2.6: Patient-Level Bootstrap for Confidence Intervals ---
+# Resamples patients (not ROIs) within a group to compute 95% CIs on mean excess.
+# This accounts for within-patient correlation across ROIs.
+# Args:
+#   data       - tibble with columns: PatientID, radius, patient_excess
+#   group_name - character label for the group
+#   radii      - numeric vector of radii
+#   n_boot     - number of bootstrap iterations
+bootstrap_ci <- function(data, group_name, radii = RADII, n_boot = N_BOOT) {
+  patients <- unique(data$PatientID)
+
+  if (length(patients) == 0) {
+    warning(paste("No patients found for group:", group_name))
+    return(tibble(radius = radii, lower = NA, upper = NA, group = group_name))
+  }
+
+  cat(sprintf("  Bootstrapping %s (n=%d patients)...\n", group_name, length(patients)))
+
+  boot_results <- map_dfr(1:n_boot, function(i) {
+    boot_patients <- sample(patients, size = length(patients), replace = TRUE)
+    data %>%
+      inner_join(tibble(PatientID = boot_patients), by = "PatientID",
+                 relationship = "many-to-many") %>%
+      group_by(radius) %>%
+      summarise(mean_excess = mean(patient_excess, na.rm = TRUE), .groups = "drop") %>%
+      mutate(boot_iter = i)
+  })
+
+  boot_results %>%
+    group_by(radius) %>%
+    summarise(
+      lower = quantile(mean_excess, 0.025, na.rm = TRUE),
+      upper = quantile(mean_excess, 0.975, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(group = group_name)
+}
+
+# --- 2.7: CSR Excess Ribbon Plot ---
+# Generates a publication-quality line+ribbon plot of CSR excess vs radius.
+# Shared by Figs 2K, 2N, 2O.
+# Args:
+#   plot_df - tibble with: group, radius, mean_excess, lower, upper
+#   title   - plot title string
+plot_csr_excess <- function(plot_df, title) {
+  ggplot(plot_df, aes(x = radius, y = mean_excess, color = group, fill = group)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.25, color = NA) +
+    geom_line(linewidth = 1.5) +
+    geom_point(size = 3.5) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40", linewidth = 0.8) +
+    scale_x_continuous(breaks = RADII) +
+    scale_color_manual(values = group_colors, name = NULL) +
+    scale_fill_manual(values = group_colors, name = NULL) +
+    labs(x = "Radius (µm)", y = "CSR Excess\n(Observed − Expected)", title = title) +
+    pub_theme_base
+}
+
+# --- 2.8: Contact Fraction Ribbon Plot ---
+# Generates a publication-quality line+ribbon plot of contact fraction vs radius.
+# Used by Figs 2L-M.
+plot_contact_fraction <- function(cf_data, title) {
+  ggplot(cf_data, aes(x = radius, y = mean_CF, color = Group, fill = Group)) +
+    geom_ribbon(aes(ymin = mean_CF - se_CF, ymax = mean_CF + se_CF),
+                alpha = 0.25, color = NA) +
+    geom_line(linewidth = 1.5) +
+    geom_point(size = 3.5) +
+    scale_x_continuous(breaks = RADII) +
+    scale_color_manual(values = group_colors, name = NULL) +
+    scale_fill_manual(values = group_colors, name = NULL) +
+    labs(x = "Radius (µm)", y = "Contact Fraction", title = title) +
+    pub_theme_base +
+    theme(plot.margin = margin(10, 10, 10, 10))
+}
+
+# --- 2.9: P-value Formatter ---
+format_p <- function(p) {
+  if (p < 0.0001) return("p < 0.0001")
+  if (p < 0.001)  return("p < 0.001")
+  if (p < 0.01)   return(sprintf("p = %.3f", p))
+  return(sprintf("p = %.2f", p))
+}
+
+
+# ==============================================================================
+# SECTION 3: LOAD AND PREPARE DATASETS
+# ==============================================================================
+
+# --- 3A: Load Post-Menopausal Neighbor Data ---
+# Cell-level data from Akoya multiplex imaging containing phenotype calls,
+# spatial coordinates, nearest-neighbor distances, and tissue category labels.
+# Each row = one segmented cell.
+PMNeighborData <- read.table(
+  file.choose(),
+  header = TRUE, sep = "\t", quote = "", check.names = FALSE,
+  fill = TRUE, comment.char = "", row.names = NULL
+)
+
+# Assign involution group based on Annotation ID prefix:
+#   N_ prefix = Non-Involuted (stagnant lobules)
+#   C_ prefix = Fully Involuted (complete lobular involution)
+# Extract PatientID (e.g., "N_C12345-..." → "C12345")
+PMNeighborData <- PMNeighborData %>%
+  mutate(
+    Group = case_when(
+      grepl("^N_", `Annotation ID`) ~ "Non-Involuted",
+      grepl("^C_", `Annotation ID`) ~ "Fully Involuted",
+      TRUE ~ "Other"
+    ),
+    PatientID = str_extract(`Annotation ID`, "(?<=^N_|^C_)[A-Z0-9]+")
+  )
+
+# Verify group counts and unique patients
+cat("=== PMNeighborData Group Counts ===\n")
+print(table(PMNeighborData$Group))
+cat("Unique patients:", length(unique(PMNeighborData$PatientID)), "\n\n")
+
+# --- 3B: Load Cell Seg Summary → Create PMDensity Table ---
+# The cell_seg_summary file contains tissue area measurements per annotation
+# and tissue category. We extract unique Annotation × Tissue Category rows
+# and convert areas from square microns to mm² for density calculations.
+
+# UPDATE THIS PATH to your local cell_seg_data_summary file
+summary_path <- file.choose()  # Select Merged cell_seg_data_summary.txt
+
+PM_cell_seg_summary <- read.delim(summary_path, stringsAsFactors = FALSE)
+
+# Keep unique Annotation ID × Tissue Category combinations, convert area
+PMDensity <- PM_cell_seg_summary %>%
+  select(Annotation.ID, Slide.ID, Tissue.Category,
+         Tissue.Category.Area..square.microns.) %>%
+  distinct() %>%
+  mutate(
+    Tissue.Area.mm2  = Tissue.Category.Area..square.microns. / 1e6,
+    Tissue.Category  = str_trim(Tissue.Category)
+  ) %>%
+  select(Annotation.ID, Slide.ID, Tissue.Category, Tissue.Area.mm2) %>%
+  arrange(Annotation.ID, Tissue.Category)
+
+# Extract PatientID from Slide.ID (e.g., "..._C12345_..." → "C12345")
+PMDensity <- PMDensity %>%
+  mutate(
+    PatientID = str_extract(Slide.ID, "_C([0-9]+)") %>%
+      str_remove("_C") %>%
+      paste0("C", .)
+  )
+
+# --- 3C: Verify Both Datasets ---
+cat("=== PMDensity Summary ===\n")
+cat("Total rows:", nrow(PMDensity), "\n")
+cat("Unique Annotation IDs:", n_distinct(PMDensity$Annotation.ID), "\n")
+cat("Unique patients:", length(unique(PMDensity$PatientID)), "\n")
+cat("\nTissue categories:\n")
+print(table(PMDensity$Tissue.Category))
+
+# Each Annotation ID should have exactly 3 tissue categories (Epithelial, Stroma, Non-tissue)
+annot_counts <- PMDensity %>%
+  group_by(Annotation.ID) %>%
+  summarise(n_cats = n(), .groups = "drop")
+
+if (all(annot_counts$n_cats == 3)) {
+  cat("\n✓ Each Annotation ID has exactly 3 tissue categories\n")
+} else {
+  cat("\n⚠ Some Annotation IDs lack 3 categories:\n")
+  print(filter(annot_counts, n_cats != 3))
+}
+
+# Confirm tissue category naming is consistent across datasets
+cat("\nTissue categories in PMNeighborData:",
+    paste(unique(PMNeighborData$`Tissue Category`), collapse = ", "), "\n")
+cat("Tissue categories in PMDensity:",
+    paste(unique(PMDensity$Tissue.Category), collapse = ", "), "\n\n")
+
+# --- 3D: Prepare Epithelial Areas for Density Calculations (Figs 2E-I) ---
+# Join key: Annotation.ID → used to normalize cell counts to cells/mm²
+epithelial_areas <- PMDensity %>%
+  filter(Tissue.Category == "Epithelial") %>%
+  select(Annotation.ID, Tissue.Area.mm2, PatientID) %>%
+  rename(`Annotation ID` = Annotation.ID)
+
+
+# ==============================================================================
+# SECTION 4: FIGURE 2C-D — SPATIAL DENSITY PROFILES (EXAMPLE ROIs)
+# ==============================================================================
+# These panels show Gaussian-smoothed spatial density curves for 4 phenotypes
+# across a single tissue ROI. Fig 2C = Non-Involuted example, Fig 2D = Involuted.
+# The x-axis represents distance across the tissue; peaks reveal spatial
+# compartmentalization of senescent, proliferating, and immune cells.
+
+# --- 4.1: Shared function to generate a spatial density panel ---
+# Filters to a specific ROI, bins cell positions, smooths, and creates the
+# combined line plot with cell count table and legend.
+make_spatial_density_panel <- function(annot_id, subtitle_text) {
+
+  # Extract cells for this ROI
+  roi <- PMNeighborData %>%
+    filter(`Annotation ID` == annot_id) %>%
+    mutate(x_aligned = `Cell X Position`)
+
+  # Define spatial bins spanning the full ROI extent
+
+  x_min  <- floor(min(roi$x_aligned, na.rm = TRUE))
+  x_max  <- ceiling(max(roi$x_aligned, na.rm = TRUE))
+  x_bins <- seq(x_min, x_max + BIN_WIDTH, by = BIN_WIDTH)
+
+  # Subset cells by phenotype and tissue compartment
+  subsets <- list(
+    "p16+ (Senescent)"       = roi %>% filter(`Tissue Category` == "Epithelial",
+                                              `Phenotype p16` == "p16+"),
+    "Ki67+ (Proliferating)"  = roi %>% filter(`Tissue Category` == "Epithelial",
+                                              `Phenotype Ki67` == "Ki67+"),
+    "Top2A+ (Proliferating)" = roi %>% filter(`Tissue Category` == "Epithelial",
+                                              `Phenotype Top2A` == "Top2A+"),
+    "CD45+ (Immune)"         = roi %>% filter(`Tissue Category` == "Stroma",
+                                              `Phenotype CD45` == "CD45+")
+  )
+
+  # Generate smoothed density for each phenotype
+  all_densities <- map2_dfr(subsets, names(subsets), function(cells, label) {
+    make_smoothed_density(cells, label, x_bins)
+  }) %>%
+    mutate(x_relative = x - min(x))
+
+  # Cell count summary table for annotation inset
+  peak_summary <- all_densities %>%
+    group_by(phenotype) %>%
+    summarise(cell_count = unique(n), .groups = "drop")
+
+  cell_count_table <- data.frame(
+    Phenotype    = gsub(" \\(.*\\)", "", peak_summary$phenotype),
+    `Cell Count` = paste0("n = ", peak_summary$cell_count),
+    check.names  = FALSE
+  )
+
+  # Build the main line plot
+  p <- ggplot(all_densities, aes(x = x_relative, y = y, color = phenotype)) +
+    geom_line(linewidth = 1.8) +
+    scale_color_manual(values = phenotype_colors, name = "Cell Phenotype") +
+    scale_x_continuous(
+      breaks = seq(0, max(all_densities$x_relative), by = 100),
+      expand = expansion(mult = c(0.01, 0.01))
+    ) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05)),
+                       labels = label_number(accuracy = 0.01)) +
+    labs(
+      subtitle = subtitle_text,
+      x = "Distance across tissue (µm)",
+      y = "Normalized cell density"
+    ) +
+    pub_theme_density +
+    guides(color = guide_legend(title = "Cell Phenotype",
+                                override.aes = list(linewidth = 3)))
+
+  # Create cell count inset table
+  count_grob <- tableGrob(
+    cell_count_table, rows = NULL,
+    theme = ttheme_minimal(
+      base_size = 24,
+      core    = list(fg_params = list(hjust = 0, x = 0.05, fontface = "plain"),
+                     bg_params = list(fill = c("grey95", "white"))),
+      colhead = list(fg_params = list(fontface = "bold"),
+                     bg_params = list(fill = "grey90"))
+    )
+  )
+
+  # Extract legend and combine with cell count table
+  legend_grob    <- cowplot::get_legend(p)
+  combined_legend <- arrangeGrob(count_grob, legend_grob, ncol = 1,
+                                 heights = c(0.4, 0.6))
+
+  # Assemble final panel: plot + legend/table sidebar
+  p_no_legend <- p + theme(legend.position = "none")
+  final <- grid.arrange(
+    p_no_legend, combined_legend,
+    ncol = 2,
+    widths = unit.c(unit(1, "null"), unit(4.0, "inches"))
+  )
+
+  return(final)
+}
+
+# --- 4.2: Generate Figure 2C — Non-Involuted Example ROI ---
+# This ROI shows separated epithelial and immune compartments (~475-500 µm gap)
+fig2c <- make_spatial_density_panel(
+  annot_id      = "N_C20410-83_Scan1.er_[16965,53016]",
+  subtitle_text = "Epithelial-immune separation = 475-500 \u00b5m"
+)
+
+# --- 4.3: Generate Figure 2D — Fully Involuted Example ROI ---
+# This ROI shows closer immune-epithelial proximity (~75-100 µm gap)
+fig2d <- make_spatial_density_panel(
+  annot_id      = "N_C21911-88_Scan1.er_[13307,54789]",
+  subtitle_text = "Epithelial-immune separation = 75-100 \u00b5m"
+)
+
+# --- 4.4: Save Density Plots ---
+for (ext in c("pdf", "png", "tiff")) {
+  ggsave(
+    sprintf("Figure2C_spatial_density_noninvoluted.%s", ext),
+    fig2c, width = 14, height = 6,
+    dpi = ifelse(ext == "tiff", 600, 300),
+    device = if (ext == "pdf") cairo_pdf else ext,
+    bg = "white",
+    compression = if (ext == "tiff") "lzw" else NULL
+  )
+  ggsave(
+    sprintf("Figure2D_spatial_density_involuted.%s", ext),
+    fig2d, width = 14, height = 6,
+    dpi = ifelse(ext == "tiff", 600, 300),
+    device = if (ext == "pdf") cairo_pdf else ext,
+    bg = "white",
+    compression = if (ext == "tiff") "lzw" else NULL
+  )
+}
+cat("✓ Figures 2C-D saved\n\n")
+
+
+# ==============================================================================
+# SECTION 5: FIGURE 2E-I — VIOLIN PLOTS (CELL DENSITIES BY GROUP)
+# ==============================================================================
+# Compare epithelial area, p16+, Ki67+, Top2A+, and CD45+ cell densities
+# between Non-Involuted and Fully Involuted groups. Each panel shows:
+#   - Violin (distribution shape per group)
+#   - Jittered ROI-level points colored by patient
+#   - Group mean ± SE (diamond + error bars)
+#   - Cluster-robust p-value (accounts for multiple ROIs per patient)
+
+# --- 5.1: Calculate ROI-Level Metrics ---
+# For each ROI (Annotation ID), compute cell densities (cells/mm²) and
+# spatial peak positions for key phenotypes.
+calculate_roi_metrics <- function(annotation_id, df, area_data) {
+
+  roi        <- df %>% filter(`Annotation ID` == annotation_id)
+  group      <- unique(roi$Group)[1]
+  patient_id <- unique(roi$PatientID)[1]
+
+  # Get epithelial tissue area for this ROI
+
+  epi_area <- area_data %>%
+    filter(`Annotation ID` == annotation_id) %>%
+    pull(Tissue.Area.mm2)
+
+  if (length(epi_area) == 0 || nrow(roi) == 0) return(NULL)
+  epi_area <- epi_area[1]
+  if (is.na(epi_area) || epi_area == 0) return(NULL)
+
+  # Define spatial bins for peak detection
+  x_min  <- floor(min(roi$`Cell X Position`, na.rm = TRUE))
+  x_max  <- ceiling(max(roi$`Cell X Position`, na.rm = TRUE))
+  x_bins <- seq(x_min, x_max + BIN_WIDTH, by = BIN_WIDTH)
+  x_mids <- head(x_bins, -1) + BIN_WIDTH / 2
+
+  # Helper: find the spatial peak position for a subset of cells
+  get_peak_position <- function(cells_subset) {
+    if (nrow(cells_subset) < 5) return(NA)
+    h    <- hist(cells_subset$`Cell X Position`, breaks = x_bins,
+                 plot = FALSE, right = FALSE, include.lowest = TRUE)
+    y_sm <- gaussian_smooth_reflect(h$counts)
+    idx  <- which.max(y_sm)
+    if (length(idx) == 0) return(NA)
+    return(x_mids[idx])
+  }
+
+  # Phenotype subsets
+  df_p16   <- roi %>% filter(`Tissue Category` == "Epithelial", `Phenotype p16` == "p16+")
+  df_ki67  <- roi %>% filter(`Tissue Category` == "Epithelial", `Phenotype Ki67` == "Ki67+")
+  df_top2a <- roi %>% filter(`Tissue Category` == "Epithelial", `Phenotype Top2A` == "Top2A+")
+  df_cd45  <- roi %>% filter(`Phenotype CD45` == "CD45+")
+  df_ck    <- roi %>% filter(`Phenotype CK` == "CK+")
+  df_epi   <- roi %>% filter(`Tissue Category` == "Epithelial")
+
+  # Peak positions for CD45-CK separation metric
+  peak_cd45 <- get_peak_position(df_cd45)
+  peak_ck   <- get_peak_position(df_ck)
+
+  tibble(
+    annotation_id       = annotation_id,
+    group               = group,
+    patient_id          = patient_id,
+    epithelial_area_mm2 = epi_area,
+    cd45_to_ck_sep      = if (!is.na(peak_cd45) & !is.na(peak_ck)) abs(peak_cd45 - peak_ck) else NA,
+    density_p16         = nrow(df_p16) / epi_area,
+    density_ki67        = nrow(df_ki67) / epi_area,
+    density_top2a       = nrow(df_top2a) / epi_area,
+    density_ck          = nrow(df_ck) / epi_area,
+    density_cd45        = nrow(df_cd45) / epi_area,
+    prop_p16            = if (nrow(df_epi) > 0) nrow(df_p16) / nrow(df_epi) else NA,
+    prop_ki67           = if (nrow(df_epi) > 0) nrow(df_ki67) / nrow(df_epi) else NA
+  )
+}
+
+# Compute metrics across all ROIs
+cat("Calculating ROI-level metrics...\n")
+all_roi_ids    <- unique(PMNeighborData$`Annotation ID`)
+roi_metrics    <- map_dfr(all_roi_ids, ~calculate_roi_metrics(.x, PMNeighborData, epithelial_areas))
+roi_metrics_clean <- roi_metrics %>% filter(!is.na(epithelial_area_mm2))
+cat(sprintf("✓ Computed metrics for %d ROIs\n", nrow(roi_metrics_clean)))
+
+# --- 5.2: Cluster-Robust Statistical Tests ---
+# Use cluster-robust SEs (clustered by patient) to account for multiple ROIs per patient
+cluster_test <- function(y_col) {
+  fit    <- lm(as.formula(paste0(y_col, " ~ group")), data = roi_metrics_clean)
+  robust <- coeftest(fit, vcov = vcovCL(fit, cluster = ~patient_id))
+  return(robust[2, "Pr(>|t|)"])
+}
+
+pvals <- list(
+  area  = cluster_test("epithelial_area_mm2"),
+  p16   = cluster_test("density_p16"),
+  ki67  = cluster_test("density_ki67"),
+  top2a = cluster_test("density_top2a"),
+  cd45  = cluster_test("density_cd45")
+)
+
+# --- 5.3: Violin Panel Builder ---
+# Creates a single violin plot panel with patient-colored points and group stats
+make_violin_panel <- function(df, y_col, title, pval, y_label, fill_colors) {
+
+  # Assign consistent colors per patient
+  patient_ids    <- sort(unique(df$patient_id))
+  patient_colors <- setNames(hue_pal()(length(patient_ids)), patient_ids)
+
+  # Group-level mean ± SE (across patient means, not individual ROIs)
+  group_stats <- df %>%
+    group_by(patient_id, group) %>%
+    summarise(patient_mean = mean(.data[[y_col]], na.rm = TRUE), .groups = "drop") %>%
+    group_by(group) %>%
+    summarise(
+      group_mean = mean(patient_mean, na.rm = TRUE),
+      group_se   = sd(patient_mean, na.rm = TRUE) / sqrt(n()),
+      .groups = "drop"
+    )
+
+  ggplot(df, aes(x = group, y = .data[[y_col]])) +
+    # Distribution shape
+    geom_violin(aes(fill = group), alpha = 0.5, trim = FALSE,
+                color = NA, scale = "width") +
+    # Individual ROI data points, colored by patient
+    geom_jitter(aes(color = patient_id), width = 0.15, size = 2, alpha = 0.6) +
+    # Group mean ± SE error bars
+    geom_errorbar(data = group_stats,
+                  aes(x = group, y = group_mean,
+                      ymin = group_mean - group_se,
+                      ymax = group_mean + group_se),
+                  width = 0.35, linewidth = 1.2, color = "black",
+                  inherit.aes = FALSE) +
+    # Group mean diamond
+    geom_point(data = group_stats,
+               aes(x = group, y = group_mean),
+               size = 6, shape = 18, color = "black",
+               inherit.aes = FALSE) +
+    scale_fill_manual(values = fill_colors) +
+    scale_color_manual(values = patient_colors) +
+    scale_y_continuous(labels = function(x) ifelse(x < 0, "", x)) +
+    labs(title = title, subtitle = format_p(pval), x = NULL, y = y_label) +
+    pub_theme_violin
+}
+
+# --- 5.4: Generate Individual Violin Panels ---
+fig2e <- make_violin_panel(roi_metrics_clean, "epithelial_area_mm2",
+                           "Epithelial Area", pvals$area,
+                           expression(bold("Area (mm"^2*")")), violin_colors$area)
+
+fig2f <- make_violin_panel(roi_metrics_clean, "density_p16",
+                           "p16+ Density", pvals$p16,
+                           expression(bold("Cells/mm"^2)), violin_colors$p16)
+
+fig2g <- make_violin_panel(roi_metrics_clean, "density_ki67",
+                           "Ki67+ Density", pvals$ki67,
+                           expression(bold("Cells/mm"^2)), violin_colors$ki67)
+
+fig2h <- make_violin_panel(roi_metrics_clean, "density_top2a",
+                           "TOP2A+ Density", pvals$top2a,
+                           expression(bold("Cells/mm"^2)), violin_colors$top2a)
+
+fig2i <- make_violin_panel(roi_metrics_clean, "density_cd45",
+                           "CD45+ Density", pvals$cd45,
+                           expression(bold("Cells/mm"^2)), violin_colors$cd45)
+
+# Display panels
+print(fig2e)
+print(fig2f)
+print(fig2g)
+print(fig2h)
+print(fig2i)
+cat("✓ Figures 2E-I generated\n\n")
+
+
+# ==============================================================================
+# SECTION 6: FIGURE 2K — p16 → p16 SELF-CLUSTERING (CSR EXCESS)
+# ==============================================================================
+# Tests whether p16+ senescent cells cluster with each other more than expected
+# under complete spatial randomness (CSR). For each epithelial p16+ cell, we
+# check whether its nearest p16+ neighbor is within radius r, then compare
+# the observed contact fraction to the CSR expectation based on p16+ density.
+# Positive excess = clustering; negative = repulsion/dispersion.
+
+# --- 6.1: Compute epithelial p16+ density (λ) per ROI ---
+# λ = number of p16+ cells / epithelial area (cells/mm²)
+p16_density <- PMNeighborData %>%
+  filter(`Tissue Category` == "Epithelial", `Phenotype p16` == "p16+") %>%
+  group_by(`Annotation ID`, PatientID) %>%
+  summarise(p16_count = n(), .groups = "drop") %>%
+  left_join(
+    PMDensity %>% filter(Tissue.Category == "Epithelial") %>%
+      select(Annotation.ID, PatientID, Tissue.Area.mm2),
+    by = c("Annotation ID" = "Annotation.ID", "PatientID" = "PatientID")
+  ) %>%
+  mutate(lambda = p16_count / Tissue.Area.mm2)
+
+# --- 6.2: Extract p16+ source cells with nearest-neighbor distances ---
+# Uses inForm-computed "Distance to p16+" column (nearest p16+ neighbor distance)
+sources_p16 <- PMNeighborData %>%
+  filter(`Tissue Category` == "Epithelial", `Phenotype p16` == "p16+") %>%
+  mutate(
+    Group = case_when(
+      startsWith(`Annotation ID`, "N_") ~ "Non-Involuted",
+      startsWith(`Annotation ID`, "C_") ~ "Fully Involuted",
+      TRUE ~ NA_character_
+    ),
+    d_p16 = as.numeric(`Distance to p16+`),
+    d_p16 = if_else(is.na(d_p16), Inf, d_p16)
+  ) %>%
+  filter(!is.na(Group))
+
+# --- 6.3: Observed contact fraction per ROI × radius ---
+# For each radius, what fraction of p16+ cells have a p16+ neighbor within r?
+obs_p16 <- sources_p16 %>%
+  group_by(PatientID, `Annotation ID`, Group) %>%
+  summarise(
+    obs = list(tibble(
+      radius   = RADII,
+      observed = sapply(RADII, function(r) mean(d_p16 <= r, na.rm = TRUE))
+    )),
+    .groups = "drop"
+  ) %>%
+  unnest(obs)
+
+# --- 6.4: CSR expected fraction + excess ---
+# Under CSR, P(neighbor within r) = 1 - exp(-λ * π * r²)
+# where λ is density in cells/mm² and r is in mm
+obs_p16 <- obs_p16 %>%
+  left_join(p16_density, by = c("PatientID", "Annotation ID")) %>%
+  mutate(
+    expected = 1 - exp(-lambda * pi * (radius / 1000)^2),
+    excess   = observed - expected
+  )
+
+# --- 6.5: Aggregate ROI-level excess → patient-level means ---
+patient_p16 <- obs_p16 %>%
+  group_by(PatientID, Group, radius) %>%
+  summarise(patient_excess = mean(excess, na.rm = TRUE), .groups = "drop")
+
+# --- 6.6: Bootstrap CIs and build plot data ---
+set.seed(SEED)
+ci_p16 <- bind_rows(
+  bootstrap_ci(filter(patient_p16, Group == "Non-Involuted"), "Non-Involuted"),
+  bootstrap_ci(filter(patient_p16, Group == "Fully Involuted"), "Fully Involuted")
+)
+
+plot_p16_csr <- patient_p16 %>%
+  group_by(group = Group, radius) %>%
+  summarise(mean_excess = mean(patient_excess, na.rm = TRUE), .groups = "drop") %>%
+  left_join(ci_p16, by = c("group", "radius"))
+
+# --- 6.7: Plot ---
+fig2k <- plot_csr_excess(plot_p16_csr, "p16 \u2192 p16 Self-Clustering")
+print(fig2k)
+cat("✓ Figure 2K generated\n\n")
+
+
+# ==============================================================================
+# SECTION 7: FIGURES 2L-M — CONTACT FRACTIONS (p16→CD45, Top2A→CD45)
+# ==============================================================================
+# Computes the fraction of epithelial source cells (p16+ or Top2A+) that have
+# at least one stromal CD45+ cell within radius r. Uses pairwise Euclidean
+# distances computed from cell XY coordinates (not inForm NN distances).
+
+# --- 7.1: Reshape data to long format for flexible phenotype filtering ---
+data_long <- PMNeighborData %>%
+  filter(Group != "Other") %>%
+  pivot_longer(
+    cols      = c(`Phenotype p16`, `Phenotype Top2A`, `Phenotype CD45`),
+    names_to  = "Marker",
+    values_to = "Status"
+  ) %>%
+  filter(Status %in% c("p16+", "Top2A+", "CD45+")) %>%
+  mutate(
+    Marker = gsub("Phenotype ", "", Marker),
+    Tissue = `Tissue Category`
+  )
+
+# --- 7.2: Contact fraction calculator ---
+# For each ROI, computes pairwise distances between epithelial sources and
+# stromal targets, then returns the fraction of sources with ≥1 target within r.
+calc_CF <- function(df, source_marker, target_marker, radius) {
+  sources <- df %>% filter(Marker == source_marker, Tissue == "Epithelial")
+  targets <- df %>% filter(Marker == target_marker, Tissue == "Stroma")
+
+  if (nrow(sources) < 1 | nrow(targets) < 1) return(NULL)
+
+  # Full pairwise distance matrix between sources and targets
+  dmat <- as.matrix(dist(rbind(
+    sources %>% select(`Cell X Position`, `Cell Y Position`),
+    targets %>% select(`Cell X Position`, `Cell Y Position`)
+  )))
+
+  n_s     <- nrow(sources)
+  n_t     <- nrow(targets)
+  dist_st <- dmat[1:n_s, (n_s + 1):(n_s + n_t), drop = FALSE]
+
+  # For each source, check if ANY target is within radius
+  contacted <- apply(dist_st, 1, function(x) any(x <= radius))
+  tibble(contact_fraction = mean(contacted))
+}
+
+# --- 7.3: Compute contact fractions for both marker pairs × all radii ---
+pairs_to_calc <- tribble(
+  ~source_marker, ~target_marker,
+  "p16",          "CD45",
+  "Top2A",        "CD45"
+)
+
+cf_results <- expand_grid(pairs_to_calc, radius = RADII) %>%
+  mutate(pair = paste(source_marker, "\u2192", target_marker)) %>%
+  pmap_dfr(function(source_marker, target_marker, radius, pair) {
+    data_long %>%
+      filter(Group %in% c("Non-Involuted", "Fully Involuted")) %>%
+      group_by(`Annotation ID`, Group) %>%
+      group_map(~ {
+        cf <- calc_CF(.x, source_marker, target_marker, radius)
+        if (is.null(cf)) return(NULL)
+        cf %>% mutate(source_marker = source_marker, target_marker = target_marker,
+                      radius = radius, Group = .y$Group, pair = pair)
+      }) %>%
+      bind_rows()
+  })
+
+# --- 7.4: Summarize contact fractions (mean ± SE by group × radius) ---
+cf_summary <- cf_results %>%
+  group_by(pair, radius, Group) %>%
+  summarise(
+    mean_CF = mean(contact_fraction, na.rm = TRUE),
+    se_CF   = sd(contact_fraction, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# --- 7.5: Generate plots ---
+fig2l <- plot_contact_fraction(
+  cf_summary %>% filter(pair == "p16 \u2192 CD45"),
+  "p16 \u2192 Stromal CD45"
+)
+
+fig2m <- plot_contact_fraction(
+  cf_summary %>% filter(pair == "Top2A \u2192 CD45"),
+  "TOP2A \u2192 Stromal CD45"
+)
+
+print(fig2l)
+print(fig2m)
+cat("✓ Figures 2L-M generated\n\n")
+
+
+# ==============================================================================
+# SECTION 8: FIGURE 2N — TOP2A → CD45 CSR EXCESS (HALO DEPLETION)
+# ==============================================================================
+# Tests whether stromal CD45+ cells are depleted around epithelial Top2A+ cells
+# (immune exclusion / "halo"). Negative CSR excess = fewer CD45+ neighbors
+# than expected under random placement.
+
+# --- 8.1: Stromal CD45+ density (λ) per ROI ---
+cd45_density <- PMNeighborData %>%
+  filter(`Tissue Category` == "Stroma", `Phenotype CD45` == "CD45+") %>%
+  group_by(`Annotation ID`, PatientID) %>%
+  summarise(cd45_count = n(), .groups = "drop") %>%
+  left_join(
+    PMDensity %>% filter(Tissue.Category == "Stroma") %>%
+      select(Annotation.ID, PatientID, Tissue.Area.mm2),
+    by = c("Annotation ID" = "Annotation.ID", "PatientID" = "PatientID")
+  ) %>%
+  mutate(lambda = cd45_count / Tissue.Area.mm2)
+
+stopifnot("Lambda table has duplicate ROIs!" = !anyDuplicated(cd45_density$`Annotation ID`))
+
+# --- 8.2: Top2A+ epithelial source cells with NN distance to CD45+ ---
+sources_top2a_cd45 <- PMNeighborData %>%
+  filter(`Tissue Category` == "Epithelial", `Phenotype Top2A` == "Top2A+") %>%
+  mutate(
+    d_cd45 = suppressWarnings(as.numeric(`Distance to CD45+`)),
+    d_cd45 = if_else(is.na(d_cd45), Inf, d_cd45),
+    group  = case_when(
+      startsWith(`Annotation ID`, "N_") ~ "Non-Involuted",
+      startsWith(`Annotation ID`, "C_") ~ "Fully Involuted",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(group))
+
+# --- 8.3: Observed fraction, CSR expected, excess per ROI × radius ---
+obs_top2a_cd45 <- sources_top2a_cd45 %>%
+  group_by(PatientID, `Annotation ID`, group) %>%
+  summarise(
+    obs_list = list(sapply(RADII, function(r) mean(d_cd45 <= r))),
+    .groups = "drop"
+  ) %>%
+  mutate(obs_tbl = map(obs_list, ~tibble(radius = RADII, observed = .x))) %>%
+  select(-obs_list) %>%
+  unnest(obs_tbl) %>%
+  left_join(cd45_density, by = c("Annotation ID", "PatientID")) %>%
+  mutate(
+    lambda   = if_else(is.na(lambda), 0, lambda),
+    expected = 1 - exp(-lambda * pi * (radius / 1000)^2),
+    excess   = observed - expected
+  ) %>%
+  filter(!is.nan(excess), !is.na(excess), !is.infinite(excess))
+
+# --- 8.4: Patient-level aggregation ---
+patient_top2a_cd45 <- obs_top2a_cd45 %>%
+  group_by(PatientID, group, radius) %>%
+  summarise(patient_excess = mean(excess, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.nan(patient_excess), !is.na(patient_excess))
+
+# --- 8.5: Bootstrap CIs and build plot ---
+set.seed(SEED)
+ci_top2a_cd45 <- bind_rows(
+  bootstrap_ci(filter(patient_top2a_cd45, group == "Non-Involuted"), "Non-Involuted"),
+  bootstrap_ci(filter(patient_top2a_cd45, group == "Fully Involuted"), "Fully Involuted")
+)
+
+plot_top2a_cd45 <- patient_top2a_cd45 %>%
+  group_by(group, radius) %>%
+  summarise(mean_excess = mean(patient_excess, na.rm = TRUE), .groups = "drop") %>%
+  left_join(ci_top2a_cd45, by = c("group", "radius"))
+
+fig2n <- plot_csr_excess(plot_top2a_cd45, "TOP2A \u2192 CD45 Halo Depletion")
+print(fig2n)
+cat("✓ Figure 2N generated\n\n")
+
+
+# ==============================================================================
+# SECTION 9: FIGURE 2O — CD45 → TOP2A CSR EXCESS
+# ==============================================================================
+# Reverse direction: do stromal CD45+ cells near the boundary have more
+# epithelial Top2A+ neighbors than expected? This tests immune-to-proliferating
+# cell proximity from the immune cell's perspective.
+
+# --- 9.1: Epithelial Top2A+ density (λ) per ROI ---
+top2a_density <- PMNeighborData %>%
+  filter(`Tissue Category` == "Epithelial", `Phenotype Top2A` == "Top2A+") %>%
+  group_by(`Annotation ID`, PatientID) %>%
+  summarise(top2a_count = n(), .groups = "drop") %>%
+  left_join(
+    PMDensity %>% filter(Tissue.Category == "Epithelial") %>%
+      select(Annotation.ID, PatientID, Tissue.Area.mm2),
+    by = c("Annotation ID" = "Annotation.ID", "PatientID" = "PatientID")
+  ) %>%
+  mutate(lambda = top2a_count / Tissue.Area.mm2)
+
+stopifnot("Lambda table has duplicate ROIs!" = !anyDuplicated(top2a_density$`Annotation ID`))
+
+# --- 9.2: Top2A lookup table to verify epithelial identity of nearest neighbor ---
+# inForm reports nearest Top2A+ regardless of compartment; we need to confirm
+# the nearest Top2A+ cell is actually in the epithelial compartment.
+top2a_lookup <- PMNeighborData %>%
+  filter(`Phenotype Top2A` == "Top2A+") %>%
+  mutate(top2a_cell_id = as.character(`Cell ID`)) %>%
+  select(`Annotation ID`, PatientID, top2a_cell_id,
+         top2a_tissue_category = `Tissue Category`)
+
+# --- 9.3: CD45+ stromal sources within 20 µm of tissue boundary ---
+# Restricting to boundary-proximal CD45+ cells focuses on immune cells
+# that could plausibly interact with the epithelial compartment.
+sources_cd45_top2a <- PMNeighborData %>%
+  filter(`Tissue Category` == "Stroma", `Phenotype CD45` == "CD45+") %>%
+  mutate(
+    dist_edge       = suppressWarnings(as.numeric(`Distance from Tissue Category Edge (microns)`)),
+    dist_top2a      = suppressWarnings(as.numeric(`Distance to Top2A+`)),
+    nearest_top2a_id = as.character(`Cell ID Top2A+`)
+  ) %>%
+  filter(!is.na(dist_edge), dist_edge <= 20) %>%
+  mutate(
+    group = case_when(
+      startsWith(`Annotation ID`, "N_") ~ "Non-Involuted",
+      startsWith(`Annotation ID`, "C_") ~ "Fully Involuted",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(group))
+
+# --- 9.4: Verify nearest Top2A+ is epithelial ---
+# If the nearest Top2A+ cell is stromal, set distance to Inf (not a valid target)
+sources_cd45_top2a <- sources_cd45_top2a %>%
+  left_join(top2a_lookup,
+            by = c("Annotation ID", "PatientID",
+                   "nearest_top2a_id" = "top2a_cell_id")) %>%
+  mutate(
+    d_top2a_epithelial = case_when(
+      is.na(top2a_tissue_category)              ~ Inf,
+      top2a_tissue_category == "Epithelial"     ~ if_else(is.na(dist_top2a), Inf, dist_top2a),
+      TRUE                                      ~ Inf
+    )
+  )
+
+cat("=== Nearest TOP2A identity breakdown ===\n")
+sources_cd45_top2a %>%
+  group_by(group, top2a_tissue_category) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  print()
+
+# --- 9.5: Observed fraction, CSR expected, excess per ROI × radius ---
+obs_cd45_top2a <- sources_cd45_top2a %>%
+  group_by(PatientID, `Annotation ID`, group) %>%
+  summarise(
+    obs_list = list(sapply(RADII, function(r) mean(d_top2a_epithelial <= r))),
+    .groups = "drop"
+  ) %>%
+  mutate(obs_tbl = map(obs_list, ~tibble(radius = RADII, observed = .x))) %>%
+  select(-obs_list) %>%
+  unnest(obs_tbl) %>%
+  left_join(top2a_density, by = c("Annotation ID", "PatientID")) %>%
+  mutate(
+    lambda   = if_else(is.na(lambda), 0, lambda),
+    expected = 1 - exp(-lambda * pi * (radius / 1000)^2),
+    excess   = observed - expected
+  ) %>%
+  filter(!is.nan(excess), !is.na(excess), !is.infinite(excess))
+
+# --- 9.6: Patient-level aggregation ---
+patient_cd45_top2a <- obs_cd45_top2a %>%
+  group_by(PatientID, group, radius) %>%
+  summarise(patient_excess = mean(excess, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.nan(patient_excess), !is.na(patient_excess))
+
+# --- 9.7: Bootstrap CIs and build plot ---
+set.seed(SEED)
+ci_cd45_top2a <- bind_rows(
+  bootstrap_ci(filter(patient_cd45_top2a, group == "Non-Involuted"), "Non-Involuted"),
+  bootstrap_ci(filter(patient_cd45_top2a, group == "Fully Involuted"), "Fully Involuted")
+)
+
+plot_cd45_top2a <- patient_cd45_top2a %>%
+  group_by(group, radius) %>%
+  summarise(mean_excess = mean(patient_excess, na.rm = TRUE), .groups = "drop") %>%
+  left_join(ci_cd45_top2a, by = c("group", "radius"))
+
+fig2o <- plot_csr_excess(plot_cd45_top2a, "CD45 \u2192 TOP2A")
+print(fig2o)
+cat("✓ Figure 2O generated\n\n")
+
+# ==============================================================================
+# SECTION 11: SUPPLEMENTAL FIGURES S2A-D
+# ==============================================================================
+# These panels use shared utilities (themes, bootstrap, constants) from Sections 1-2.
+
+# --- 11.1: Shared Theme for Probability Plots (S2A-B) ---
+# Slightly smaller text than main figure panels; used for boundary probability curves
+pub_theme_probability <- theme_classic(base_size = 16, base_family = "sans") +
+  theme(
+    plot.title    = element_text(face = "bold", size = 26, hjust = 0.5,
+                                 margin = margin(b = 5)),
+    plot.subtitle = element_text(face = "bold", size = 13, hjust = 0.5,
+                                 color = "grey20", margin = margin(b = 15)),
+    axis.title.x  = element_text(face = "bold", size = 20, margin = margin(t = 12)),
+    axis.title.y  = element_text(face = "bold", size = 20, margin = margin(r = 12)),
+    axis.text     = element_text(size = 16, color = "black"),
+    axis.line     = element_line(color = "black", linewidth = 1),
+    axis.ticks    = element_line(color = "black", linewidth = 0.8),
+    axis.ticks.length = unit(0.2, "cm"),
+    panel.background  = element_rect(fill = "white", color = NA),
+    plot.background   = element_rect(fill = "white", color = NA),
+    plot.margin       = margin(20, 25, 20, 20)
+  )
+
+
+# --- 11.2: Shared CD45 Tissue Lookup Table ---
+# Maps each CD45+ cell to its tissue compartment (Stroma vs Epithelial).
+# Used by S2A and S2B to determine whether the nearest CD45+ neighbor
+# of an epithelial source cell resides in the stroma.
+cd45_tissue_lookup <- PMNeighborData %>%
+  filter(`Phenotype CD45` == "CD45+") %>%
+  mutate(`Cell ID` = as.character(`Cell ID`)) %>%
+  select(PatientID, `Annotation ID`, `Cell ID`, `Tissue Category`) %>%
+  rename(nearest_cd45_cell_id = `Cell ID`,
+         nearest_cd45_tissue  = `Tissue Category`)
+
+
+# --- 11.3: Shared Probability Pipeline Function ---
+# For a given epithelial phenotype (p16+ or Top2A+), this function:
+#   1. Filters to epithelial source cells within 0-80 µm of boundary
+#   2. Bins by distance from epithelial-stromal boundary (2 µm bins)
+#   3. Joins to CD45 lookup to check if nearest CD45+ is stromal
+#   4. Computes patient-level proportion per distance bin
+#   5. Bootstraps 95% CIs (resampling patients)
+#   6. Returns a publication-quality line+ribbon plot
+#
+# Args:
+#   phenotype_col   - column name for phenotype call (e.g., "Phenotype p16")
+#   phenotype_value - positive call string (e.g., "p16+")
+#   plot_title      - title for the plot panel
+compute_boundary_probability <- function(phenotype_col, phenotype_value, plot_title) {
+
+  # Step 1: Filter to epithelial source cells near the boundary
+  # Only Non-Involuted group (comparing within stagnant tissue)
+  source_data <- PMNeighborData %>%
+    filter(
+      .data[[phenotype_col]] == phenotype_value,
+      `Tissue Category` == "Epithelial",
+      Group != "Fully Involuted"
+    ) %>%
+    mutate(
+      dist_to_boundary = as.numeric(as.character(`Distance from Tissue Category Edge (microns)`)),
+      dist_to_cd45     = as.numeric(as.character(`Distance to CD45+`)),
+      `Cell ID CD45+`  = as.character(`Cell ID CD45+`)
+    ) %>%
+    filter(!is.na(dist_to_boundary), !is.na(dist_to_cd45),
+           dist_to_boundary >= 0, dist_to_boundary <= 80) %>%
+    # Bin distance from boundary into 2 µm intervals
+    mutate(dist_bin = cut(dist_to_boundary, breaks = seq(0, 80, by = 2),
+                          include.lowest = TRUE, right = FALSE)) %>%
+    # Join to determine if nearest CD45+ is in stroma
+    left_join(cd45_tissue_lookup,
+              by = c("PatientID", "Annotation ID",
+                     "Cell ID CD45+" = "nearest_cd45_cell_id")) %>%
+    mutate(nearest_cd45_is_stromal = ifelse(nearest_cd45_tissue == "Stroma", 1, 0))
+
+  # Step 2: Patient-level proportions per distance bin
+  patient_props <- source_data %>%
+    group_by(PatientID, Group, dist_bin) %>%
+    summarise(
+      prop_stromal = mean(nearest_cd45_is_stromal, na.rm = TRUE),
+      n_sources    = n(),
+      .groups      = "drop"
+    )
+
+  # Step 3: Bootstrap CIs per distance bin (resampling patients)
+  boot_ci_bin <- function(df, nboot = N_BOOT) {
+    patients <- unique(df$PatientID)
+    boot_means <- replicate(nboot, {
+      sampled <- sample(patients, length(patients), replace = TRUE)
+      df %>%
+        filter(PatientID %in% sampled) %>%
+        summarise(m = mean(prop_stromal, na.rm = TRUE)) %>%
+        pull(m)
+    })
+    quantile(boot_means, probs = c(0.025, 0.975), na.rm = TRUE)
+  }
+
+  ci_results <- patient_props %>%
+    group_by(Group, dist_bin) %>%
+    nest() %>%
+    mutate(
+      ci        = map(data, boot_ci_bin),
+      mean_prop = map_dbl(data, ~mean(.x$prop_stromal, na.rm = TRUE))
+    ) %>%
+    unnest_wider(ci) %>%
+    rename(ci_lower = `2.5%`, ci_upper = `97.5%`) %>%
+    mutate(
+      # Extract bin midpoint from factor label (e.g., "[0,2)" → 1)
+      dist_midpoint = as.numeric(sub(",.*", "", gsub("\\[|\\)", "", as.character(dist_bin)))) + 1
+    )
+
+  # Step 4: Build plot
+  ggplot(ci_results, aes(x = dist_midpoint, y = mean_prop)) +
+    geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.25, fill = "#0072B2") +
+    geom_line(linewidth = 1.5, color = "#0072B2") +
+    geom_point(size = 3.5, color = "#0072B2") +
+    scale_x_continuous(breaks = seq(0, 80, by = 10)) +
+    scale_y_continuous(breaks = seq(0, 1, by = 0.2)) +
+    labs(
+      x        = "Distance from Epithelial-Stromal Boundary (\u00b5m)",
+      y        = "Probability Nearest CD45\nis Stromal",
+      title    = plot_title,
+      subtitle = "Stromal Immune Engagement Peaks at the Epithelium\u2013Stroma Boundary"
+    ) +
+    pub_theme_probability
+}
+
+
+# ==============================================================================
+# FIGURE S2A: p16+ → Nearest CD45+ Stromal Probability vs Boundary Distance
+# ==============================================================================
+# For each epithelial p16+ cell in Non-Involuted tissue, what is the probability
+# that its nearest CD45+ neighbor is in the stroma, as a function of how far
+# the p16+ cell is from the epithelial-stromal boundary?
+# Expectation: probability is highest near the boundary and decays with distance.
+
+figS2a <- compute_boundary_probability("Phenotype p16", "p16+", "p16\u207a Epithelial Cells")
+print(figS2a)
+cat("\u2713 Figure S2A generated\n\n")
+
+
+# ==============================================================================
+# FIGURE S2B: Top2A+ → Nearest CD45+ Stromal Probability vs Boundary Distance
+# ==============================================================================
+# Same analysis as S2A but for Top2A+ proliferating epithelial cells.
+
+figS2b <- compute_boundary_probability("Phenotype Top2A", "Top2A+", "TOP2A\u207a Epithelial Cells")
+print(figS2b)
+cat("\u2713 Figure S2B generated\n\n")
+
+
+# ==============================================================================
+# FIGURE S2C: Interaction Effect — CD45 Density × Boundary Coupling on Proliferation
+# ==============================================================================
+# Tests whether the effect of stromal CD45+ density on epithelial proliferation
+# (Ki67+ or Top2A+) depends on how strongly p16+ cells are coupled to stromal
+# CD45+ at the boundary. A significant negative interaction means that when
+# p16+ boundary coupling is high AND CD45+ density is high, proliferation is
+# suppressed — consistent with senescence-mediated immune surveillance.
+
+# --- S2C.1: Build lobule-level table with group labels ---
+lobules_s2c <- PMDensity %>%
+  select(Annotation.ID, PatientID, Tissue.Category, Tissue.Area.mm2) %>%
+  rename(`Annotation ID` = Annotation.ID) %>%
+  left_join(
+    PMNeighborData %>% select(PatientID, `Annotation ID`, Group) %>% distinct(),
+    by = c("Annotation ID", "PatientID")
+  )
+
+# --- S2C.2: Generic density calculator ---
+# Counts positive cells per ROI and normalizes by tissue area
+make_density_s2c <- function(marker_col, marker_value, tissue_filter) {
+  counts <- PMNeighborData %>%
+    filter(`Tissue Category` == tissue_filter) %>%
+    mutate(flag = ifelse(.data[[marker_col]] == marker_value, 1, 0)) %>%
+    group_by(PatientID, `Annotation ID`, Group) %>%
+    summarise(marker_count = sum(flag, na.rm = TRUE), .groups = "drop")
+
+  lobules_s2c %>%
+    filter(Tissue.Category == tissue_filter) %>%
+    left_join(counts, by = c("Annotation ID", "PatientID", "Group")) %>%
+    mutate(
+      marker_count = ifelse(is.na(marker_count), 0, marker_count),
+      density      = marker_count / Tissue.Area.mm2
+    ) %>%
+    group_by(`Annotation ID`) %>%
+    summarise(density = unique(density), .groups = "drop")
+}
+
+# Epithelial proliferation densities
+p16_dens_s2c   <- make_density_s2c("Phenotype p16",  "p16+",  "Epithelial")
+ki67_dens_s2c  <- make_density_s2c("Phenotype Ki67", "Ki67+", "Epithelial")
+top2a_dens_s2c <- make_density_s2c("Phenotype Top2A","Top2A+","Epithelial")
+
+# --- S2C.3: Stromal CD45+ density per ROI ---
+cd45_dens_s2c <- PMNeighborData %>%
+  filter(`Tissue Category` == "Stroma") %>%
+  mutate(flag = ifelse(`Phenotype CD45` == "CD45+", 1, 0)) %>%
+  group_by(PatientID, `Annotation ID`, Group) %>%
+  summarise(cd45_count = sum(flag, na.rm = TRUE), .groups = "drop")
+
+cd45_dens_s2c <- lobules_s2c %>%
+  filter(Tissue.Category == "Stroma") %>%
+  left_join(cd45_dens_s2c, by = c("Annotation ID", "PatientID", "Group")) %>%
+  mutate(
+    cd45_count   = ifelse(is.na(cd45_count), 0, cd45_count),
+    cd45_density = cd45_count / Tissue.Area.mm2
+  ) %>%
+  group_by(`Annotation ID`) %>%
+  summarise(cd45_density = unique(cd45_density), .groups = "drop")
+
+# --- S2C.4: Boundary coupling metric ---
+# For each ROI: among boundary-proximal p16+ cells (within 20 µm of edge),
+# what fraction have their nearest CD45+ neighbor in the stroma?
+boundary_coupling <- PMNeighborData %>%
+  filter(`Phenotype p16` == "p16+", `Tissue Category` == "Epithelial") %>%
+  mutate(dist_to_boundary = as.numeric(as.character(
+    `Distance from Tissue Category Edge (microns)`))) %>%
+  filter(dist_to_boundary <= 20) %>%
+  mutate(`Cell ID CD45+` = as.character(`Cell ID CD45+`)) %>%
+  select(`Annotation ID`, `Cell ID`, `Cell ID CD45+`) %>%
+  left_join(
+    cd45_tissue_lookup %>% select(`Annotation ID`, nearest_cd45_cell_id, nearest_cd45_tissue),
+    by = c("Annotation ID", "Cell ID CD45+" = "nearest_cd45_cell_id")
+  ) %>%
+  mutate(nearest_cd45_is_stromal = ifelse(nearest_cd45_tissue == "Stroma", 1, 0)) %>%
+  group_by(`Annotation ID`) %>%
+  summarise(boundary_p16_cd45_adj = mean(nearest_cd45_is_stromal, na.rm = TRUE),
+            .groups = "drop")
+
+# --- S2C.5: Merge all ROI-level metrics ---
+roi_interaction <- lobules_s2c %>%
+  filter(Tissue.Category == "Epithelial") %>%
+  left_join(p16_dens_s2c   %>% rename(p16_density   = density), by = "Annotation ID") %>%
+  left_join(ki67_dens_s2c  %>% rename(ki67_density  = density), by = "Annotation ID") %>%
+  left_join(top2a_dens_s2c %>% rename(top2a_density = density), by = "Annotation ID") %>%
+  left_join(cd45_dens_s2c,                                      by = "Annotation ID") %>%
+  left_join(boundary_coupling,                                  by = "Annotation ID")
+
+# --- S2C.6: Fit interaction models ---
+# Model: Proliferation ~ CD45 density × boundary coupling
+# The interaction term captures whether the CD45 effect on proliferation
+# depends on how tightly p16+ cells are coupled to stromal immune cells.
+model_ki67_int  <- lm(ki67_density  ~ cd45_density * boundary_p16_cd45_adj, data = roi_interaction)
+model_top2a_int <- lm(top2a_density ~ cd45_density * boundary_p16_cd45_adj, data = roi_interaction)
+
+# --- S2C.7: Extract interaction coefficients ---
+coef_ki67_int  <- summary(model_ki67_int)$coefficients
+coef_top2a_int <- summary(model_top2a_int)$coefficients
+
+interaction_df <- data.frame(
+  Outcome = c("Ki67\u207a Epithelial", "TOP2A\u207a Epithelial"),
+  Beta = c(coef_ki67_int["cd45_density:boundary_p16_cd45_adj", "Estimate"],
+           coef_top2a_int["cd45_density:boundary_p16_cd45_adj", "Estimate"]),
+  SE   = c(coef_ki67_int["cd45_density:boundary_p16_cd45_adj", "Std. Error"],
+           coef_top2a_int["cd45_density:boundary_p16_cd45_adj", "Std. Error"])
+) %>%
+  mutate(
+    CI_low  = Beta - 1.96 * SE,
+    CI_high = Beta + 1.96 * SE
+  )
+
+# --- S2C.8: Plot ---
+figS2c <- ggplot(interaction_df, aes(x = Outcome, y = Beta)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40",
+             linewidth = 1, alpha = 0.7) +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 0.25,
+                linewidth = 2, color = "#95A5A6") +
+  geom_point(size = 8, color = "#95A5A6") +
+  # Beta value labels
+  geom_text(aes(label = sprintf("\u03b2 = %.3f", Beta)),
+            vjust = -0.7, size = 6, fontface = "bold", family = "sans") +
+  # CI labels
+  geom_text(aes(label = sprintf("95%% CI: [%.2f, %.2f]", CI_low, CI_high)),
+            vjust = 2.5, size = 5, family = "sans") +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 8),
+                     expand = expansion(mult = c(0.2, 0.2))) +
+  labs(
+    x        = "",
+    y        = "Interaction Effect (\u03b2)\nCD45\u207a Density \u00d7 Boundary Coupling",
+    title    = "Stromal CD45\u207a Density and p16\u207a Coupling\nEffect on Proliferation",
+    subtitle = "Linked to lower TOP2A\u207a and Ki67\u207a epithelial proliferation",
+    caption  = "Model: Outcome ~ CD45 density \u00d7 boundary coupling | Linear regression with interaction"
+  ) +
+  theme_minimal(base_size = 16, base_family = "sans") +
+  theme(
+    plot.title    = element_text(face = "bold", size = 28, hjust = 0.5,
+                                 lineheight = 1.1, margin = margin(b = 10)),
+    plot.subtitle = element_text(size = 22, hjust = 0.5, margin = margin(b = 15)),
+    plot.caption  = element_text(size = 16, hjust = 0, face = "italic",
+                                 margin = margin(t = 15)),
+    axis.title.x  = element_text(face = "bold", size = 28, margin = margin(t = 12)),
+    axis.title.y  = element_text(face = "bold", size = 24, margin = margin(r = 12)),
+    axis.text.x   = element_text(size = 22, face = "bold", margin = margin(t = 8)),
+    axis.text.y   = element_text(size = 18),
+    axis.line      = element_line(color = "black", linewidth = 1.5),
+    axis.ticks     = element_line(color = "black", linewidth = 0.8),
+    axis.ticks.length = unit(0.2, "cm"),
+    panel.border   = element_rect(color = "black", fill = NA, linewidth = 1.2),
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.5),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.background   = element_rect(fill = "white", color = NA),
+    plot.background    = element_rect(fill = "white", color = NA),
+    plot.margin        = margin(40, 30, 25, 25)
+  )
+
+print(figS2c)
+cat("\u2713 Figure S2C generated\n\n")
+
+
+# ==============================================================================
+# FIGURE S2D: ΔG_ES — CD45 Stroma → p16 Epithelium CSR Excess by Distance Band
+# ==============================================================================
+# Computes the CSR excess of stromal CD45+ cells contacting epithelial p16+
+# cells at multiple radii, then summarizes into Near/Mid/Far distance bands.
+# The delta (Non-Involuted minus Fully Involuted) shows whether the spatial
+# relationship between immune and senescent cells differs by involution status.
+
+# --- S2D.1: Extended radii for band analysis ---
+radii_extended <- c(5, 10, 15, 20, 30, 45, 60, 100)
+
+# CSR expectation: P(contact within r) = 1 - exp(-λ π r²)
+csr_expected <- function(lambda, r) {
+  1 - exp(-lambda * pi * (r / 1000)^2)
+}
+
+# --- S2D.2: Lobule areas for density normalization ---
+lobules_s2d <- PMDensity %>%
+  select(Annotation.ID, PatientID, Tissue.Area.mm2) %>%
+  rename(`Annotation ID` = Annotation.ID)
+
+# --- S2D.3: Epithelial p16+ density (λ for CSR baseline) ---
+p16_density_s2d <- PMNeighborData %>%
+  filter(`Phenotype p16` == "p16+", `Tissue Category` == "Epithelial") %>%
+  group_by(PatientID, `Annotation ID`) %>%
+  summarise(p16_count = n(), .groups = "drop") %>%
+  left_join(lobules_s2d, by = c("PatientID", "Annotation ID")) %>%
+  mutate(p16_density = p16_count / Tissue.Area.mm2) %>%
+  filter(!is.na(p16_density), p16_density > 0) %>%
+  select(PatientID, `Annotation ID`, p16_density)
+
+# --- S2D.4: Contact fraction for stromal CD45+ → epithelial p16+ ---
+# For each stromal CD45+ cell, check if its nearest p16+ is within radius r
+cf_ES <- PMNeighborData %>%
+  filter(`Phenotype CD45` == "CD45+", `Tissue Category` == "Stroma") %>%
+  mutate(dist = suppressWarnings(as.numeric(`Distance to p16+`))) %>%
+  filter(!is.na(dist))
+
+cf_ES_results <- map_dfr(radii_extended, function(r) {
+  cf_ES %>%
+    group_by(PatientID, `Annotation ID`, Group) %>%
+    summarise(
+      n_src        = n(),
+      contact_frac = mean(dist <= r),
+      radius       = r,
+      .groups      = "drop"
+    )
+})
+
+# --- S2D.5: CSR-adjusted excess ---
+excess_ES <- cf_ES_results %>%
+  left_join(p16_density_s2d, by = c("PatientID", "Annotation ID"),
+            relationship = "many-to-many") %>%
+  mutate(
+    csr    = csr_expected(p16_density, radius),
+    excess = contact_frac - csr
+  ) %>%
+  filter(!is.na(excess))
+
+# --- S2D.6: Aggregate into distance bands ---
+# Near (≤15 µm): direct contact zone
+# Mid (16-45 µm): paracrine signaling range
+# Far (>45 µm): distal / control zone
+dg_ES <- excess_ES %>%
+  group_by(PatientID, Group, radius) %>%
+  summarise(excess = mean(excess, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = radius, values_from = excess) %>%
+  mutate(
+    Near = rowMeans(across(all_of(as.character(radii_extended[radii_extended <= 15]))),
+                    na.rm = TRUE),
+    Mid  = rowMeans(across(all_of(as.character(radii_extended[radii_extended > 15 &
+                                                               radii_extended <= 45]))),
+                    na.rm = TRUE),
+    Far  = rowMeans(across(all_of(as.character(radii_extended[radii_extended > 45]))),
+                    na.rm = TRUE)
+  ) %>%
+  select(PatientID, Group, Near, Mid, Far)
+
+# --- S2D.7: Compute delta (Non-Involuted − Fully Involuted) per band ---
+delta_ES <- dg_ES %>%
+  pivot_longer(cols = c(Near, Mid, Far), names_to = "Band", values_to = "Excess") %>%
+  group_by(Band, Group) %>%
+  summarise(mean_val = mean(Excess, na.rm = TRUE),
+            se_val   = sd(Excess, na.rm = TRUE) / sqrt(n()),
+            .groups  = "drop") %>%
+  pivot_wider(names_from = Group, values_from = c(mean_val, se_val)) %>%
+  rename(
+    mean_Fully = `mean_val_Fully Involuted`,
+    mean_Non   = `mean_val_Non-Involuted`,
+    se_Fully   = `se_val_Fully Involuted`,
+    se_Non     = `se_val_Non-Involuted`
+  ) %>%
+  mutate(
+    delta = mean_Non - mean_Fully,
+    SE    = sqrt(se_Non^2 + se_Fully^2),
+    # Order bands logically
+    Band  = factor(Band, levels = c("Near", "Mid", "Far"))
+  )
+
+# --- S2D.8: Plot ---
+figS2d <- ggplot(delta_ES, aes(x = Band, y = delta, group = 1)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_errorbar(aes(ymin = delta - SE, ymax = delta + SE),
+                width = 0.15, linewidth = 1) +
+  geom_point(size = 4) +
+  labs(
+    title = "\u0394G_ES (CD45 Stroma \u2192 p16 Epithelium)",
+    x     = "Distance Band",
+    y     = "Non-Involuted \u2212 Fully Involuted"
+  ) +
+  pub_theme_base +
+  theme(
+    plot.title = element_text(size = 26),
+    axis.text.x = element_text(size = 22, face = "bold")
+  )
+
+print(figS2d)
+cat("\u2713 Figure S2D generated\n\n")
+
+
+# ==============================================================================
+# SECTION 12: UPDATED SUMMARY
+# ==============================================================================
+cat("============================================\n")
+cat("  SUPPLEMENTAL FIGURES S2A-D COMPLETE\n")
+cat("============================================\n")
+cat("Panels generated:\n")
+cat("  2C:   Non-Involuted spatial density profile\n")
+cat("  2D:   Fully Involuted spatial density profile\n")
+cat("  2E:   Epithelial area violin\n")
+cat("  2F:   p16+ density violin\n")
+cat("  2G:   Ki67+ density violin\n")
+cat("  2H:   TOP2A+ density violin\n")
+cat("  2I:   CD45+ density violin\n")
+cat("  2K:   p16->p16 self-clustering (CSR excess)\n")
+cat("  2L:   p16->CD45 contact fraction\n")
+cat("  2M:   TOP2A->CD45 contact fraction\n")
+cat("  2N:   TOP2A->CD45 halo depletion (CSR excess)\n")
+cat("  2O:   CD45->TOP2A proximity (CSR excess)\n")
+cat("  S2A:  p16+ boundary probability (nearest CD45+ is stromal)\n")
+cat("  S2B:  Top2A+ boundary probability (nearest CD45+ is stromal)\n")
+cat("  S2C:  Interaction effect (CD45 density x boundary coupling)\n")
+cat("  S2D:  \u0394G_ES distance band analysis (CD45 stroma -> p16 epi)\n")
+cat("============================================\n")
+
+
