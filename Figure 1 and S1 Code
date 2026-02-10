@@ -1,0 +1,641 @@
+# ============================================================================
+# Figure 1 & Supplementary Figures S1
+# ============================================================================
+#
+# Publication:
+#   [Manuscript title — update before submission]
+#
+# Description:
+#   This script generates all panels for Figure 1 and Supplementary Figure S1,
+#   characterizing proliferative gene expression and protein-level differences
+#   between completely involuted ("Complete") and noninvoluted ("Noninvoluted")
+#   breast tissue samples.
+#
+# Figures produced:
+#   Fig 1C  — PCA of top 500 most variable genes (PC1 vs PC2)
+#   Fig 1D  — Composite proliferation index by involution group
+#   Fig 1F  — Acini count per lobule by involution group (IHC)
+#   Fig 1G  — TOP2A+ cells per lobule by involution group (IHC)
+#   Supp S1A — PC1 loadings for proliferation-associated genes
+#   Supp S1B — Volcano plot of differential expression (DASL array)
+#   Supp S1D — PC1 score vs composite proliferation index (correlation)
+#   Supp S1H — Ki67+ cells per lobule by involution group (IHC)
+#   Supp S1I — Ki67 vs TOP2A scatter plot per lobule
+#
+# Data requirements:
+#   All input CSVs and Excel files should be placed in a local "data/" folder
+#   (see FILE PATHS section below). Patient identifiers have been removed;
+#   samples are referenced by de-identified labels only.
+#
+# Dependencies:
+#   dplyr, ggplot2, readr, readxl, ggrepel, sandwich, lmtest, scales
+#
+# Usage:
+#   Source this script in R/RStudio, or run chunks sequentially in an
+#   R Markdown notebook.
+# ============================================================================
+
+
+# ============================================================================
+# 0.  SETUP — Load packages
+# ============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(readr)
+  library(readxl)
+  library(ggrepel)
+  library(sandwich)    # cluster-robust variance estimation
+  library(lmtest)      # coeftest() for cluster-robust inference
+  library(scales)      # pretty_breaks(), hue_pal()
+})
+
+
+# ============================================================================
+# 1.  FILE PATHS
+# ============================================================================
+# Update these paths to match your local directory structure.
+# All data files are expected in a single "data/" folder.
+
+DATA_DIR <- "data"
+
+combined_metrics_path <- file.path(DATA_DIR, "Combined_sample_metrics_PCA_and_proliferation_index.csv")
+pca_scores_path       <- file.path(DATA_DIR, "Fig1C_PCA_PC1_PC2_scores.csv")
+prolif_index_path     <- file.path(DATA_DIR, "Fig1D_composite_proliferation_index.csv")
+pc1_loadings_path     <- file.path(DATA_DIR, "SuppFigS1A_PC1_loadings_proliferation_genes.csv")
+pc1_vs_pi_path        <- file.path(DATA_DIR, "SuppFigS1D_PC1_vs_proliferation_index.csv")
+dasl_path             <- file.path(DATA_DIR, "DASL_expression_data.xlsx")
+ihc_path              <- file.path(DATA_DIR, "IHC_results_Ki67_Top2a_acini.xlsx")
+
+# Output directory for processed data and saved figures
+OUT_DIR <- "output"
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+
+# ============================================================================
+# 2.  LOAD DATA
+# ============================================================================
+
+# Pre-computed PCA scores (PC1, PC2) and variance explained per component
+pca_scores <- read_csv(pca_scores_path, show_col_types = FALSE)
+
+# Composite proliferation index per sample (mean z-score of proliferation genes)
+prolif_index <- read_csv(prolif_index_path, show_col_types = FALSE)
+
+# PC1 loadings for individual proliferation-associated genes
+pc1_loadings <- read_csv(pc1_loadings_path, show_col_types = FALSE)
+
+# Paired PC1 score and proliferation index per sample (for correlation analysis)
+pc1_vs_pi <- read_csv(pc1_vs_pi_path, show_col_types = FALSE)
+
+# DASL gene expression array data (genes × samples)
+dasl <- read_excel(dasl_path)
+
+# IHC quantification data: Ki67+, TOP2A+ cell counts and acini per lobule
+ihc_raw <- read_excel(ihc_path)
+
+
+# ============================================================================
+# 3.  GLOBAL AESTHETICS — Shared color palette and theme elements
+# ============================================================================
+
+# Text and accent colors
+text_color   <- "black"
+grid_color   <- "#E8E8E8"
+accent_color <- "#34495E"
+
+# Group colors (consistent across all figures)
+group1_color <- "#3498DB"   # Blue  — Complete involution
+group2_color <- "#E74C3C"   # Red   — Noninvoluted
+
+# Color for PC1 loading bars
+loading_color <- "#1A237E"
+
+# Reusable theme for IHC dot plots (Figs 1F, 1G, S1H, S1I)
+base_theme_ihc <- theme_minimal(base_size = 20, base_family = "sans") +
+  theme(
+    plot.title       = element_text(face = "bold", size = 26, color = text_color,
+                                    hjust = 0.5, margin = margin(b = 5)),
+    plot.subtitle    = element_text(size = 20, color = text_color,
+                                    hjust = 0.5, margin = margin(b = 15)),
+    axis.title.x     = element_blank(),
+    axis.title.y     = element_text(face = "bold", size = 22, color = text_color,
+                                    margin = margin(r = 10)),
+    axis.text.x      = element_text(size = 22, color = text_color, face = "bold"),
+    axis.text.y      = element_text(size = 22, color = text_color),
+    axis.line        = element_line(color = accent_color, linewidth = 0.8),
+    panel.border     = element_rect(color = accent_color, fill = NA, linewidth = 0.9),
+    panel.grid.major.y = element_line(color = grid_color, linewidth = 0.4),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.background   = element_rect(fill = "white", color = NA),
+    plot.background    = element_rect(fill = "white", color = NA),
+    legend.position    = "none",
+    plot.margin        = margin(20, 20, 20, 20)
+  )
+
+
+# ============================================================================
+# 4.  STATISTICAL TESTS (Gene Expression)
+# ============================================================================
+
+# Welch two-sample t-test comparing composite proliferation index between groups
+tt <- t.test(proliferation_index ~ group, data = prolif_index)
+
+# Pearson correlation between PC1 score and composite proliferation index
+ct <- cor.test(pc1_vs_pi$PC1, pc1_vs_pi$proliferation_index)
+
+cat("\n=== Gene Expression Statistical Tests ===\n")
+cat(sprintf("  Welch t-test (Fig 1D)  p = %.5f\n", tt$p.value))
+cat(sprintf("  Pearson r (Supp S1D)   r = %.3f, p = %.4f\n", ct$estimate, ct$p.value))
+
+
+# ============================================================================
+# 5.  FIGURE 1C — PCA Scatter Plot (PC1 vs PC2)
+# ============================================================================
+# Displays the first two principal components from PCA of the top 500 most
+# variable genes across all samples. Points are colored and shaped by
+# involution group. Percentage of variance explained is annotated on axes.
+
+pc1_var <- round(100 * unique(pca_scores$PC1_var_explained), 1)
+pc2_var <- round(100 * unique(pca_scores$PC2_var_explained), 1)
+
+fig1c <- ggplot(pca_scores, aes(x = PC1, y = PC2, shape = group, color = group)) +
+  geom_point(size = 5.5, alpha = 0.8, stroke = 1) +
+  geom_text(
+    aes(label = sample_label),
+    vjust   = -1.2,
+    size    = 4.5,
+    color   = text_color,
+    fontface = "bold"
+  ) +
+  scale_color_manual(values = c(group1_color, group2_color)) +
+  scale_shape_manual(values = c(16, 17)) +
+  scale_x_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = 0.1)) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = 0.1)) +
+  labs(
+    x        = paste0("PC1 (", pc1_var, "%)"),
+    y        = paste0("PC2 (", pc2_var, "%)"),
+    title    = "Principal Component Analysis",
+    subtitle = "Top 500 Most Variable Genes",
+    color    = "Group",
+    shape    = "Group"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 24, color = text_color,
+                                 hjust = 0.5, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 18, color = text_color,
+                                 hjust = 0.5, margin = margin(b = 15)),
+    axis.title    = element_text(face = "bold", size = 22, color = text_color),
+    axis.text     = element_text(size = 16, color = text_color),
+    axis.line     = element_line(color = accent_color, linewidth = 0.7),
+    panel.border  = element_rect(color = accent_color, fill = NA, linewidth = 0.9),
+    panel.grid.major = element_line(color = grid_color, linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.position  = "top",
+    legend.title     = element_text(face = "bold", size = 12, color = text_color),
+    legend.text      = element_text(size = 11, color = text_color),
+    plot.margin      = margin(20, 20, 20, 20)
+  )
+
+print(fig1c)
+
+
+# ============================================================================
+# 6.  FIGURE 1D — Composite Proliferation Index (Bar + Dot Plot)
+# ============================================================================
+# Bar heights represent the group mean of the composite proliferation index
+# (mean z-score across proliferation genes). Individual sample points are
+# overlaid with jitter. A crossbar marks the mean. The Welch t-test p-value
+# is displayed in the subtitle.
+
+prolif_means <- prolif_index %>%
+  group_by(group) %>%
+  summarise(mean_index = mean(proliferation_index, na.rm = TRUE), .groups = "drop")
+
+fig1d <- ggplot(prolif_index, aes(x = group, y = proliferation_index,
+                                   color = group, fill = group)) +
+  # Semi-transparent bars showing group means
+
+  geom_col(
+    data    = prolif_means,
+    aes(x = group, y = mean_index),
+    alpha   = 0.3,
+    width   = 0.6,
+    color   = NA
+  ) +
+  # Reference line at y = 0
+
+  geom_hline(yintercept = 0, linetype = "dashed", color = accent_color,
+             linewidth = 0.8) +
+  # Individual sample points
+  geom_point(position = position_jitter(width = 0.08), size = 3.5, alpha = 0.8) +
+  # Mean crossbar overlay
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5,
+               linewidth = 1.2, color = accent_color) +
+  scale_color_manual(values = c(group1_color, group2_color)) +
+  scale_fill_manual(values  = c(group1_color, group2_color)) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = 0.08)) +
+  labs(
+    x        = "",
+    y        = "Composite Proliferation Index\n(mean z-score)",
+    title    = "Composite Proliferation Index by Group",
+    subtitle = sprintf("Welch t-test: p = %.5f", tt$p.value)
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 24, color = text_color,
+                                 hjust = 0.5, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 22, color = text_color,
+                                 hjust = 0.5, margin = margin(b = 15)),
+    axis.title.x  = element_blank(),
+    axis.title.y  = element_text(face = "bold", size = 24, color = text_color,
+                                  margin = margin(r = 10), lineheight = 1.1),
+    axis.text.x   = element_text(size = 22, color = text_color, face = "bold"),
+    axis.text.y   = element_text(size = 22, color = text_color),
+    axis.line     = element_line(color = accent_color, linewidth = 0.7),
+    panel.border  = element_rect(color = accent_color, fill = NA, linewidth = 0.9),
+    panel.grid.major.y = element_line(color = grid_color, linewidth = 0.4),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.background   = element_rect(fill = "white", color = NA),
+    plot.background    = element_rect(fill = "white", color = NA),
+    legend.position    = "none",
+    plot.margin        = margin(20, 20, 20, 20)
+  )
+
+print(fig1d)
+
+
+# ============================================================================
+# 7.  IHC DATA PREPARATION (Figs 1F, 1G, S1H, S1I)
+# ============================================================================
+# IHC quantification was performed on FFPE tissue sections stained for Ki67
+# and TOP2A. Each row represents one lobule; multiple lobules may come from
+# the same tissue block (patient). Block IDs are used as clustering variables
+# for robust inference.
+
+ihc <- ihc_raw %>%
+  mutate(
+    Block    = as.factor(`Block #`),
+    Status   = factor(Status, levels = c("C", "N")),
+    group    = recode(Status, C = "Complete", N = "Noninvoluted"),
+    `# Acini` = as.numeric(`# Acini`),
+    Ki67     = as.numeric(Ki67),
+    Top2A    = as.numeric(Top2A)
+  ) %>%
+  filter(!is.na(group))
+
+cat("\n=== IHC Data Summary ===\n")
+cat("  Total lobules:       ", nrow(ihc), "\n")
+cat("  Complete:            ", sum(ihc$group == "Complete"), "\n")
+cat("  Noninvoluted:        ", sum(ihc$group == "Noninvoluted"), "\n")
+cat("  Unique blocks:       ", n_distinct(ihc$Block), "\n")
+
+# Save processed lobule-level data (de-identified)
+write_csv(ihc, file.path(OUT_DIR, "IHC_lobule_level_data.csv"))
+
+
+# ============================================================================
+# 8.  CLUSTER-ROBUST STATISTICAL TESTS (IHC)
+# ============================================================================
+# Because multiple lobules are measured per patient (block), standard t-tests
+# would understate uncertainty. We use OLS with cluster-robust standard errors
+# (clustered by Block) via the sandwich package.
+
+cluster_t_test <- function(outcome, data, cluster_var = "Block") {
+  formula <- as.formula(paste0("`", outcome, "` ~ group"))
+  fit     <- lm(formula, data = data)
+  cl_vcov <- vcovCL(fit, cluster = as.formula(paste0("~", cluster_var)))
+  coeftest(fit, vcov = cl_vcov)
+}
+
+t_acini <- cluster_t_test("# Acini", ihc)
+t_top2a <- cluster_t_test("Top2A",   ihc)
+t_ki67  <- cluster_t_test("Ki67",    ihc)
+
+# Helper: extract p-value for the group coefficient (row 2)
+get_cluster_p <- function(ct) ct[2, "Pr(>|t|)"]
+
+cat("\n=== Cluster-Robust Statistical Tests (IHC) ===\n")
+cat(sprintf("  # Acini:  p = %.4f\n", get_cluster_p(t_acini)))
+cat(sprintf("  Top2A:    p = %.4f\n", get_cluster_p(t_top2a)))
+cat(sprintf("  Ki67:     p = %.4f\n", get_cluster_p(t_ki67)))
+
+
+# ============================================================================
+# 9.  FIGURE 1F — Acini per Lobule
+# ============================================================================
+# Each point is a single lobule, colored by tissue block (patient).
+# Crossbar indicates group mean. Cluster-robust p-value shown in subtitle.
+
+block_colors <- hue_pal()(n_distinct(ihc$Block))
+
+fig1f <- ggplot(ihc, aes(x = group, y = `# Acini`, color = Block)) +
+  geom_jitter(width = 0.15, size = 4, alpha = 0.7, stroke = 0.5) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5,
+               linewidth = 1.5, color = accent_color) +
+  scale_color_manual(values = block_colors) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = 0.08)) +
+  labs(
+    y        = "# Acini per Lobule",
+    title    = "Acini per Lobule",
+    subtitle = sprintf("Cluster-robust p = %.4f", get_cluster_p(t_acini))
+  ) +
+  base_theme_ihc
+
+print(fig1f)
+
+
+# ============================================================================
+# 10. FIGURE 1G — TOP2A+ Cells per Lobule
+# ============================================================================
+
+fig1g <- ggplot(ihc, aes(x = group, y = Top2A, color = Block)) +
+  geom_jitter(width = 0.15, size = 4, alpha = 0.7, stroke = 0.5) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5,
+               linewidth = 1.5, color = accent_color) +
+  scale_color_manual(values = block_colors) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = 0.08)) +
+  labs(
+    y        = "TOP2A\u207A Cells per Lobule",
+    title    = "TOP2A\u207A Cells per Lobule",
+    subtitle = sprintf("Cluster-robust p = %.4f", get_cluster_p(t_top2a))
+  ) +
+  base_theme_ihc
+
+print(fig1g)
+
+
+# ============================================================================
+# 11. SUPP FIG S1H — Ki67+ Cells per Lobule
+# ============================================================================
+
+supp_s1h <- ggplot(ihc, aes(x = group, y = Ki67, color = Block)) +
+  geom_jitter(width = 0.15, size = 4, alpha = 0.7, stroke = 0.5) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5,
+               linewidth = 1.5, color = accent_color) +
+  scale_color_manual(values = block_colors) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = 0.08)) +
+  labs(
+    y        = "Ki67\u207A Cells per Lobule",
+    title    = "Ki67\u207A Cells per Lobule",
+    subtitle = sprintf("Cluster-robust p = %.4f", get_cluster_p(t_ki67))
+  ) +
+  base_theme_ihc
+
+print(supp_s1h)
+
+
+# ============================================================================
+# 12. SUPP FIG S1A — PC1 Loadings for Proliferation Genes
+# ============================================================================
+# Horizontal bar chart showing the contribution (loading) of each
+# proliferation-associated gene to the first principal component.
+
+supp_s1a <- ggplot(pc1_loadings,
+                   aes(x = reorder(gene, PC1_loading), y = PC1_loading)) +
+  geom_col(fill = loading_color, alpha = 0.8, width = 0.7) +
+  coord_flip() +
+  scale_y_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = 0.05)) +
+  labs(
+    x        = "",
+    y        = "PC1 Loading",
+    title    = "PC1 Loadings for Proliferation Genes",
+    subtitle = "Contribution of each gene to first principal component"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 24, color = text_color,
+                                 hjust = 0.5, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 18, color = text_color,
+                                 hjust = 0.5, margin = margin(b = 15)),
+    axis.title.x  = element_text(face = "bold", size = 24, color = text_color,
+                                  margin = margin(t = 10)),
+    axis.title.y  = element_blank(),
+    axis.text.x   = element_text(size = 16, color = text_color),
+    axis.text.y   = element_text(size = 16, color = text_color, face = "bold"),
+    axis.line     = element_line(color = accent_color, linewidth = 0.7),
+    panel.border  = element_rect(color = accent_color, fill = NA, linewidth = 0.9),
+    panel.grid.major.x = element_line(color = grid_color, linewidth = 0.4),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.background   = element_rect(fill = "white", color = NA),
+    plot.background    = element_rect(fill = "white", color = NA),
+    plot.margin        = margin(20, 20, 20, 20)
+  )
+
+print(supp_s1a)
+
+
+# ============================================================================
+# 13. SUPP FIG S1B — Volcano Plot (DASL Differential Expression)
+# ============================================================================
+# Compares gene expression between Noninvoluted and Complete groups using
+# the DASL array. Log2 fold change is plotted against -log10(p-value).
+# Key proliferation genes are highlighted in red and labeled.
+
+# --- De-identified sample group assignments ---
+# Samples are referenced by column position in the DASL expression matrix.
+# Original patient IDs have been replaced with de-identified labels.
+complete_ids <- c("S01", "S02", "S03", "S04")
+noninv_ids   <- c("S05", "S06", "S07", "S08", "S09", "S10", "S11", "S12")
+
+# NOTE: The column names in your DASL file must match these de-identified
+# labels. If your file still contains original IDs, create a mapping and
+# rename columns before running this section. Example:
+#
+#   id_map <- c("OrigID1" = "S01", "OrigID2" = "S02", ...)
+#   dasl <- dasl %>% rename(!!!id_map)
+
+# Genes to highlight on the volcano plot
+highlight_genes <- c(
+  "TOP2A", "CDCA3", "UBE2C", "MAD2L1", "KIF11",
+  "CDCA8", "MCM7", "TYMS", "KIF18B"
+)
+
+gene_col <- names(dasl)[1]  # first column assumed to be gene symbol
+
+# Verify all sample columns exist
+all_ids      <- c(complete_ids, noninv_ids)
+missing_cols <- setdiff(all_ids, names(dasl))
+if (length(missing_cols) > 0) {
+  stop("Missing sample columns in DASL data: ", paste(missing_cols, collapse = ", "),
+       "\nPlease rename columns to match de-identified labels.")
+}
+
+# Compute per-gene fold change and p-value (Welch t-test)
+volcano_df <- dasl %>%
+  rowwise() %>%
+  mutate(
+    mean_complete = mean(c_across(all_of(complete_ids)), na.rm = TRUE),
+    mean_noninv   = mean(c_across(all_of(noninv_ids)),   na.rm = TRUE),
+    log2FC        = log2(mean_noninv / mean_complete),
+    p_value       = tryCatch(
+      t.test(
+        unlist(c_across(all_of(noninv_ids))),
+        unlist(c_across(all_of(complete_ids))),
+        var.equal = FALSE
+      )$p.value,
+      error = function(e) NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    neg_log10_p = -log10(p_value),
+    highlight   = !!sym(gene_col) %in% highlight_genes
+  )
+
+# Build the volcano plot with highlighted genes layered on top
+supp_s1b <- ggplot() +
+  # Background (non-highlighted) genes in grey
+  geom_point(
+    data  = filter(volcano_df, !highlight),
+    aes(x = log2FC, y = neg_log10_p),
+    color = "grey70", alpha = 0.7, size = 3.5
+  ) +
+  # Highlighted proliferation genes in red
+  geom_point(
+    data  = filter(volcano_df, highlight),
+    aes(x = log2FC, y = neg_log10_p),
+    color = "red", alpha = 0.9, size = 3.5
+  ) +
+  # Gene name labels (repelled to avoid overlap)
+  geom_text_repel(
+    data  = filter(volcano_df, highlight),
+    aes(x = log2FC, y = neg_log10_p, label = !!sym(gene_col)),
+    size = 6, max.overlaps = Inf, family = "sans"
+  ) +
+  # Significance threshold line (p = 0.05)
+  geom_hline(yintercept = 1.301, linetype = "dashed", color = "black",
+             linewidth = 0.8) +
+  # Fold change reference lines
+  geom_vline(xintercept = 0, color = "grey30", linewidth = 0.8) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "red",
+             linewidth = 0.8) +
+  labs(
+    x     = "log2 fold change (Noninvoluted \u2212 Complete)",
+    y     = expression(-log[10](p)),
+    title = "Differential Expression (DASL)"
+  ) +
+  theme_bw(base_size = 16, base_family = "sans") +
+  theme(
+    plot.title    = element_text(face = "bold", size = 24, hjust = 0.5, color = "black"),
+    axis.title    = element_text(face = "bold", size = 21, color = "black"),
+    axis.text     = element_text(size = 18, color = "black"),
+    axis.line     = element_line(color = accent_color, linewidth = 0.8),
+    panel.border  = element_rect(color = accent_color, fill = NA, linewidth = 0.9),
+    panel.grid.major = element_line(color = grid_color, linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.position  = "none"
+  )
+
+print(supp_s1b)
+
+
+# ============================================================================
+# 14. SUPP FIG S1D — PC1 Score vs Composite Proliferation Index
+# ============================================================================
+# Scatter plot with linear regression fit showing the strong correlation
+# between PC1 score (driven by proliferation genes) and the composite
+# proliferation index across all samples.
+
+supp_s1d <- ggplot(pc1_vs_pi, aes(x = PC1, y = proliferation_index,
+                                    shape = group, color = group)) +
+  geom_point(size = 5.5, alpha = 0.8, stroke = 1) +
+  # Linear regression fit with confidence band
+  geom_smooth(
+    method   = "lm",
+    se       = TRUE,
+    linewidth = 1.7,
+    alpha    = 0.2,
+    color    = accent_color,
+    fill     = accent_color
+  ) +
+  scale_color_manual(values = c(group1_color, group2_color)) +
+  scale_shape_manual(values = c(16, 17)) +
+  scale_x_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = 0.08)) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = 0.08)) +
+  labs(
+    x        = "PC1 Score",
+    y        = "Composite Proliferation Index",
+    title    = "PC1 Score vs Composite Proliferation Index",
+    subtitle = sprintf("Pearson r = %.3f, p = %.4f", ct$estimate, ct$p.value),
+    color    = "Group",
+    shape    = "Group"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 24, color = text_color,
+                                 hjust = 0.5, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 18, color = text_color,
+                                 hjust = 0.5, margin = margin(b = 15)),
+    axis.title    = element_text(face = "bold", size = 24, color = text_color),
+    axis.text     = element_text(size = 18, color = text_color),
+    axis.line     = element_line(color = accent_color, linewidth = 0.7),
+    panel.border  = element_rect(color = accent_color, fill = NA, linewidth = 0.9),
+    panel.grid.major = element_line(color = grid_color, linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.position  = "top",
+    legend.title     = element_text(face = "bold", size = 20, color = text_color),
+    legend.text      = element_text(size = 18, color = text_color),
+    plot.margin      = margin(20, 20, 20, 20)
+  )
+
+print(supp_s1d)
+
+
+# ============================================================================
+# 15. SUPP FIG S1I — Ki67 vs TOP2A Scatter (Per Lobule)
+# ============================================================================
+# Lobule-level scatter plot comparing Ki67+ and TOP2A+ cell counts, colored
+# by involution group. Linear regression lines per group illustrate the
+# positive correlation between the two proliferation markers.
+
+# Set draw order so Noninvoluted points render first (Complete on top)
+ihc <- ihc %>%
+  mutate(group = factor(group, levels = c("Noninvoluted", "Complete"))) %>%
+  arrange(group)
+
+group_colors_scatter <- c(
+  "Noninvoluted" = "#D62728",
+  "Complete"     = "#1F77B4"
+)
+
+supp_s1i <- ggplot(ihc, aes(x = Ki67, y = Top2A, color = group)) +
+  geom_point(size = 4, alpha = 0.75, stroke = 0.5) +
+  # Per-group linear regression lines (no CI band)
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.2) +
+  scale_color_manual(values = group_colors_scatter) +
+  scale_x_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = c(0.05, 0.08))) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = c(0.05, 0.08))) +
+  labs(
+    x     = "Ki67\u207A Cells per Lobule",
+    y     = "TOP2A\u207A Cells per Lobule",
+    title = "Ki67\u207A and TOP2A\u207A Epithelial Density"
+  ) +
+  base_theme_ihc +
+  theme(
+    legend.position = "right",
+    legend.title    = element_blank(),
+    legend.text     = element_text(size = 18),
+    plot.title      = element_text(face = "bold", size = 28, hjust = 0.5),
+    axis.title.x    = element_text(face = "bold", size = 24),
+    axis.title.y    = element_text(face = "bold", size = 24)
+  )
+
+print(supp_s1i)
+
+
+# ============================================================================
+# 16. SESSION INFO
+# ============================================================================
+cat("\n=== Session Info ===\n")
+sessionInfo()
