@@ -322,6 +322,546 @@ cat("\nAll four data frames are loaded and validated.\n")
 cat("Proceed to Figure 3 plotting script.\n")
 
 # ============================================================================
+# 8.  LOAD & PREPARE — MBC Clinical Data (Figs 3A, 3B, S3A)
+# ============================================================================
+# The MBC (Mayo Benign Breast Disease Cohort) NanoString dataset contains
+# paired morphometric measurements from initial and subsequent biopsies,
+# along with clinical metadata (age at biopsy, years to menopause, etc.).
+# This data is used for the pace-of-involution histogram (3A), the paired
+# trajectory plot (3B), and the imaging-subset trajectory plot (S3A).
+
+library(boot)       # bootstrap confidence intervals
+library(viridis)    # continuous color scales for trajectory plots
+
+mbc_path <- file.path(DATA_DIR, "MBC_clinical_data.xlsx")
+mbc_data <- read_excel(mbc_path)
+
+# Standardize column names (replace spaces/special chars with dots)
+names(mbc_data) <- make.names(names(mbc_data), unique = TRUE)
+
+# ----------------------------------------------------------------------------
+# 8a. Convert morphometric columns to numeric
+# ----------------------------------------------------------------------------
+# These columns may be read as character from Excel; ensure numeric type
+# for downstream log-ratio calculations.
+
+mbc_data <- mbc_data %>%
+  mutate(
+    init.med.lob.area2  = as.numeric(init.med.lob.area2),
+    sub.med.lob.area1   = as.numeric(sub.med.lob.area1),
+    init.med.lob.acini2 = as.numeric(init.med.lob.acini2),
+    sub.med.lob.acini1  = as.numeric(sub.med.lob.acini1),
+    years.between.biop  = as.numeric(years.between.biop)
+  )
+
+# ----------------------------------------------------------------------------
+# 8b. Compute the pace-of-involution index
+# ----------------------------------------------------------------------------
+# The pace index quantifies the rate of lobular involution between paired
+# biopsies. It is the average of two log-ratio rates:
+#   1. pace_area  = [log(initial area)  - log(subsequent area)]  / years between
+#   2. pace_acini = [log(initial acini) - log(subsequent acini)] / years between
+#
+# Positive values indicate forward (normal) involution; negative values
+# indicate lobular expansion or stagnation.
+
+mbc_data <- mbc_data %>%
+  mutate(
+    pace_area_per_year  = (log(init.med.lob.area2)  - log(sub.med.lob.area1))  / years.between.biop,
+    pace_acini_per_year = (log(init.med.lob.acini2) - log(sub.med.lob.acini1)) / years.between.biop,
+    pace_index          = (pace_area_per_year + pace_acini_per_year) / 2
+  )
+
+# ----------------------------------------------------------------------------
+# 8c. Compute summary statistics for the pace index
+# ----------------------------------------------------------------------------
+pace_values  <- mbc_data$pace_index[!is.na(mbc_data$pace_index)]
+n_total      <- length(pace_values)
+n_positive   <- sum(pace_values > 0)
+median_pace  <- median(pace_values)
+
+# Convert median pace to an interpretable percent decrease per year
+median_pct_decrease <- (1 - exp(-median_pace)) * 100
+
+# Bootstrap 95% CI for the median (10,000 replicates)
+set.seed(123)
+boot_median <- boot(pace_values, statistic = function(x, i) median(x[i]), R = 10000)
+median_ci   <- quantile(boot_median$t, c(0.025, 0.975))
+
+cat("\n=== Pace Index Summary ===\n")
+cat(sprintf("  n = %d women with valid pace index\n", n_total))
+cat(sprintf("  Median pace: %.3f log units/year (%.1f%% decrease/year)\n",
+            median_pace, median_pct_decrease))
+cat(sprintf("  95%% bootstrap CI: [%.3f, %.3f]\n", median_ci[1], median_ci[2]))
+cat(sprintf("  Forward involution: %d / %d (%.1f%%)\n",
+            n_positive, n_total, 100 * n_positive / n_total))
+
+# ----------------------------------------------------------------------------
+# 8d. Prepare paired trajectory data (for Figs 3B and S3A)
+# ----------------------------------------------------------------------------
+# Filter to women with complete menopause-proximity and pace data, then
+# flip the sign of years-to-menopause so that negative = pre-menopausal
+# and positive = post-menopausal (matching standard clinical convention).
+
+paired_trajectory <- mbc_data %>%
+  filter(
+    !is.na(pace_index),
+    !is.na(init.age),
+    !is.na(sub.age),
+    !is.na(years_to_meno_init),
+    !is.na(years_to_meno_sub)
+  ) %>%
+  mutate(
+    init_years_from_meno = -years_to_meno_init,
+    sub_years_from_meno  = -years_to_meno_sub
+  )
+
+cat(sprintf("  Paired trajectory data: %d women\n", nrow(paired_trajectory)))
+
+
+# ============================================================================
+# 9.  FINAL SUMMARY
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  All Data Preparation Complete\n")
+cat("========================================\n\n")
+cat("Available data frames:\n")
+cat("  initial_nn_data       — NN data (initial biopsy imaging cohort)\n")
+cat("  initial_density       — Density table (initial biopsy imaging cohort)\n")
+cat("  subsequent_nn_data    — NN data (subsequent imaging cohort)\n")
+cat("  subsequent_density    — Density table (subsequent imaging cohort)\n")
+cat("  mbc_data              — Full MBC clinical dataset with pace index\n")
+cat("  paired_trajectory     — Subset with complete menopause-proximity data\n")
+cat("\nProceed to Figure 3 plotting scripts.\n")
+
+
+# ============================================================================
+# Figures 3A, 3B & Supplementary Figure S3A
+# Pace of Involution: Distribution and Paired Trajectories
+# ============================================================================
+#
+# Description:
+#   This script generates three figures characterizing the pace of lobular
+#   involution across paired biopsies in the MBC cohort:
+#
+#   Fig 3A  — Histogram of the composite pace-of-involution index across
+#             all women with paired biopsies.
+#   Fig 3B  — Paired trajectory plot showing each woman's involution pace
+#             relative to menopause timing, with age-colored initial biopsy
+#             points connected to subsequent biopsy points.
+#   Supp S3A — Same trajectory layout, filtered to the imaging subset
+#              (women with multiplex IF data), highlighted in red.
+#
+# Prerequisite:
+#   Run "Figure3_data_preparation.R" first. This script expects:
+#     - mbc_data              Full MBC dataset with pace_index computed
+#     - paired_trajectory     Subset with complete menopause-proximity data
+#     - pace_values, n_total, n_positive, median_pace,
+#       median_pct_decrease, median_ci   (summary statistics)
+#
+# ============================================================================
+
+
+# ============================================================================
+# 0.  SHARED AESTHETICS
+# ============================================================================
+
+text_color   <- "black"
+grid_color   <- "#E8E8E8"
+accent_color <- "#2C3E50"
+
+# Reusable theme for trajectory plots (Figs 3B, S3A)
+theme_trajectory <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 26, color = text_color,
+                                 hjust = 0.5, margin = margin(b = 8)),
+    plot.subtitle = element_text(size = 16, color = text_color, hjust = 0.5,
+                                 lineheight = 1.2, margin = margin(b = 15)),
+    axis.title.x  = element_text(face = "bold", size = 24, color = text_color,
+                                  margin = margin(t = 10)),
+    axis.title.y  = element_text(face = "bold", size = 22, color = text_color,
+                                  margin = margin(r = 10)),
+    axis.text     = element_text(size = 20, color = text_color),
+    axis.line     = element_line(color = accent_color, linewidth = 0.6),
+    panel.border  = element_rect(color = accent_color, fill = NA, linewidth = 0.8),
+    panel.grid.major = element_line(color = grid_color, linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.position    = "right",
+    legend.title       = element_text(face = "bold", size = 14, color = text_color),
+    legend.text        = element_text(size = 14, color = text_color),
+    legend.background  = element_rect(fill = "white", color = NA),
+    plot.margin        = margin(15, 15, 15, 15)
+  )
+
+
+# ============================================================================
+# 1.  FIGURE 3A — Pace-of-Involution Histogram
+# ============================================================================
+# Displays the distribution of the composite pace index across all women
+# with valid paired biopsy data. The pace index is the mean of two log-ratio
+# rates (lobular area and acini count). Positive values = forward involution.
+# A vertical solid line marks the cohort median; a dashed line marks zero.
+
+fig3a <- ggplot(mbc_data, aes(x = pace_index)) +
+  # Histogram bars
+  geom_histogram(
+    bins      = 20,
+    fill      = "#E67E22",
+    color     = accent_color,
+    alpha     = 0.85,
+    linewidth = 0.3
+  ) +
+  # Zero reference line (no net change)
+  geom_vline(
+    xintercept = 0,
+    color      = accent_color,
+    linetype   = "dashed",
+    linewidth  = 0.8,
+    alpha      = 0.7
+  ) +
+  # Median reference line
+  geom_vline(
+    xintercept = median_pace,
+    color      = "#C0392B",
+    linetype   = "solid",
+    linewidth  = 1,
+    alpha      = 0.9
+  ) +
+  # Median label
+  annotate(
+    "text",
+    x        = median_pace,
+    y        = Inf,
+    label    = paste0("Median\n", round(median_pace, 3)),
+    vjust    = 1.5,
+    hjust    = -0.1,
+    color    = "#C0392B",
+    size     = 5.5,
+    fontface = "bold"
+  ) +
+  labs(
+    x        = "Pace Index (log units/year)",
+    y        = "Count",
+    title    = "Distribution of Lobular Involution Pace",
+    subtitle = paste0(
+      "n = ", n_total,
+      " | Median: ", round(median_pace, 3), " log units/yr",
+      " (", round(median_pct_decrease, 1), "% decrease/yr)\n",
+      "Forward involution: ", round(100 * n_positive / n_total, 1), "%",
+      " | 95% CI: [", round(median_ci[1], 3), ", ", round(median_ci[2], 3), "]"
+    )
+  ) +
+  scale_x_continuous(
+    breaks = seq(
+      floor(min(pace_values, na.rm = TRUE) * 2.5) / 2.5,
+      ceiling(max(pace_values, na.rm = TRUE) * 2.5) / 2.5,
+      by = 0.4
+    ),
+    expand = expansion(mult = 0.02)
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme_minimal(base_size = 18) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 32, color = text_color,
+                                 hjust = 0.5, margin = margin(b = 10)),
+    plot.subtitle = element_text(size = 18, color = text_color, hjust = 0.5,
+                                 lineheight = 1.2, margin = margin(b = 15)),
+    axis.title.x  = element_text(face = "bold", size = 30, color = text_color,
+                                  margin = margin(t = 10)),
+    axis.title.y  = element_text(face = "bold", size = 30, color = text_color,
+                                  margin = margin(r = 10)),
+    axis.text     = element_text(size = 30, color = text_color),
+    axis.line     = element_line(color = accent_color, linewidth = 0.5),
+    panel.grid.major = element_line(color = "#ECF0F1", linewidth = 0.4),
+    panel.grid.minor = element_line(color = "#ECF0F1", linewidth = 0.2),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    plot.margin      = margin(20, 20, 20, 20)
+  )
+
+print(fig3a)
+
+
+# ============================================================================
+# 2.  FIGURE 3B — Paired Involution Trajectories (Full Cohort)
+# ============================================================================
+# Each woman is represented by a horizontal segment connecting her initial
+# biopsy (circle, colored by age) to her subsequent biopsy (open triangle)
+# along the x-axis (years from menopause). The y-axis shows her involution
+# pace index. This reveals heterogeneous trajectories across menopause timing.
+
+# ----------------------------------------------------------------------------
+# 2a. Prepare plotting data for the full cohort
+# ----------------------------------------------------------------------------
+# Filter to a reasonable window around menopause for clear visualization
+trajectory_full <- paired_trajectory %>%
+  filter(
+    init_years_from_meno >= -12 & init_years_from_meno <= 12,
+    sub_years_from_meno  >= -12 & sub_years_from_meno  <= 12
+  ) %>%
+  select(
+    Woman_ID  = Clinic..,
+    pace_index,
+    init_age  = init.age,
+    sub_age   = sub.age,
+    init_years_from_meno,
+    sub_years_from_meno
+  )
+
+# Reshape to long format for point layers
+trajectory_full_long <- trajectory_full %>%
+  pivot_longer(
+    cols      = c(init_years_from_meno, sub_years_from_meno),
+    names_to  = "timepoint",
+    values_to = "years_from_meno"
+  ) %>%
+  mutate(
+    biopsy_age = ifelse(timepoint == "init_years_from_meno", init_age, sub_age),
+    biopsy_type = ifelse(timepoint == "init_years_from_meno", "Initial", "Subsequent")
+  )
+
+# Y-axis limits with 15% padding
+y_range  <- range(trajectory_full$pace_index, na.rm = TRUE)
+y_buffer <- diff(y_range) * 0.15
+y_limits_full <- c(y_range[1] - y_buffer, y_range[2] + y_buffer)
+
+# ----------------------------------------------------------------------------
+# 2b. Build the trajectory plot
+# ----------------------------------------------------------------------------
+fig3b <- ggplot() +
+  # Connecting segments (one per woman: initial → subsequent)
+  geom_segment(
+    data = trajectory_full,
+    aes(x = init_years_from_meno, xend = sub_years_from_meno,
+        y = pace_index,           yend = pace_index),
+    color     = "gray60",
+    alpha     = 0.35,
+    linewidth = 0.5
+  ) +
+  # Initial biopsy points (filled circles, colored by age at initial biopsy)
+  geom_point(
+    data = filter(trajectory_full_long, biopsy_type == "Initial"),
+    aes(x = years_from_meno, y = pace_index, fill = biopsy_age),
+    shape  = 21,
+    size   = 4,
+    alpha  = 0.9,
+    color  = "white",
+    stroke = 0.5
+  ) +
+  # Subsequent biopsy points (open triangles, grey outline)
+  geom_point(
+    data = filter(trajectory_full_long, biopsy_type == "Subsequent"),
+    aes(x = years_from_meno, y = pace_index),
+    shape  = 24,
+    size   = 3,
+    fill   = NA,
+    color  = "grey70",
+    stroke = 0.8,
+    alpha  = 0.9
+  ) +
+  # Reference lines: menopause (x = 0) and no-change (y = 0)
+  geom_vline(xintercept = 0, linetype = "dashed", color = accent_color,
+             linewidth = 0.8, alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = accent_color,
+             linewidth = 0.6, alpha = 0.6) +
+  # Menopause label
+  annotate(
+    "text", x = 0.5, y = y_limits_full[2] * 0.86,
+    label = "Menopause", angle = 90, vjust = -0.5,
+    size = 4.0, fontface = "italic", color = accent_color
+  ) +
+  # Continuous age color scale (viridis plasma palette)
+  scale_fill_viridis_c(
+    name   = "Age at initial\nbiopsy (years)",
+    option = "plasma",
+    begin  = 0.15,
+    end    = 0.95,
+    guide  = guide_colorbar(
+      title.position = "top", title.hjust = 0.5,
+      barwidth = 1.2, barheight = 12,
+      frame.colour = accent_color, ticks.colour = accent_color
+    )
+  ) +
+  scale_x_continuous(
+    breaks = seq(-12, 15, 2),
+    limits = c(-12, 15),
+    expand = c(0.02, 0)
+  ) +
+  scale_y_continuous(
+    limits = y_limits_full,
+    breaks = pretty_breaks(n = 8),
+    expand = c(0.02, 0)
+  ) +
+  labs(
+    x        = "Years from menopause\n(negative = pre-menopausal, positive = post-menopausal)",
+    y        = "Involution pace (log units/year)",
+    title    = "Heterogeneous Involution Trajectories Across Age and Menopause",
+    subtitle = sprintf(
+      "Paired biopsies from %d women | Lines connect same woman over time\nCircles = initial biopsy, Triangles = subsequent biopsy",
+      nrow(trajectory_full)
+    )
+  ) +
+  theme_trajectory
+
+print(fig3b)
+
+
+# ============================================================================
+# 3.  SUPP FIG S3A — Trajectory Plot (Imaging Subset Highlighted)
+# ============================================================================
+# Same layout as Fig 3B but filtered to the subset of women who also have
+# multiplex immunofluorescence imaging data. Segments are shown in red to
+# distinguish this subset from the full cohort.
+
+# ----------------------------------------------------------------------------
+# 3a. Define the imaging subset
+# ----------------------------------------------------------------------------
+# These are the de-identified IDs (from the initial biopsy block column)
+# of women whose tissue was also processed for multiplex IF.
+# NOTE: These IDs correspond to internal block identifiers, not PHI.
+
+imaging_subset_ids <- c(
+  "C25337", "C23158", "C2675",  "C24103", "MR10710", "CR5634",
+  "C9606",  "M31644", "C24737", "M6930",  "C5222",   "C2089",
+  "C31183", "C26582", "M11474", "C38385"
+)
+
+# ----------------------------------------------------------------------------
+# 3b. Filter trajectory data to imaging subset only
+# ----------------------------------------------------------------------------
+# Use a wider x-axis window to accommodate this subset's menopause range
+trajectory_imaging <- paired_trajectory %>%
+  filter(
+    init_years_from_meno >= -10 & init_years_from_meno <= 25,
+    sub_years_from_meno  >= -20 & sub_years_from_meno  <= 26
+  ) %>%
+  select(
+    Woman_ID  = init.block2,
+    pace_index,
+    init_age  = init.age,
+    sub_age   = sub.age,
+    init_years_from_meno,
+    sub_years_from_meno
+  ) %>%
+  filter(Woman_ID %in% imaging_subset_ids)
+
+# Report which imaging IDs were successfully matched
+matched_ids <- unique(trajectory_imaging$Woman_ID)
+missing_ids <- setdiff(imaging_subset_ids, matched_ids)
+
+cat("\n=== Imaging Subset Match ===\n")
+cat(sprintf("  Matched: %d / %d\n", length(matched_ids), length(imaging_subset_ids)))
+if (length(missing_ids) > 0) {
+  cat("  Not found in trajectory data:", paste(missing_ids, collapse = ", "), "\n")
+}
+
+# Reshape to long format
+trajectory_imaging_long <- trajectory_imaging %>%
+  pivot_longer(
+    cols      = c(init_years_from_meno, sub_years_from_meno),
+    names_to  = "timepoint",
+    values_to = "years_from_meno"
+  ) %>%
+  mutate(
+    biopsy_age  = ifelse(timepoint == "init_years_from_meno", init_age, sub_age),
+    biopsy_type = ifelse(timepoint == "init_years_from_meno", "Initial", "Subsequent")
+  )
+
+# Y-axis limits for imaging subset
+y_range_img  <- range(trajectory_imaging$pace_index, na.rm = TRUE)
+y_buffer_img <- diff(y_range_img) * 0.15
+y_limits_img <- c(y_range_img[1] - y_buffer_img, y_range_img[2] + y_buffer_img)
+
+# ----------------------------------------------------------------------------
+# 3c. Build the imaging-subset trajectory plot
+# ----------------------------------------------------------------------------
+supp_s3a <- ggplot() +
+  # Red connecting segments (imaging subset)
+  geom_segment(
+    data = trajectory_imaging,
+    aes(x = init_years_from_meno, xend = sub_years_from_meno,
+        y = pace_index,           yend = pace_index),
+    color     = "#E74C3C",
+    alpha     = 0.9,
+    linewidth = 1.2
+  ) +
+  # Initial biopsy points (filled circles, colored by age, black outline)
+  geom_point(
+    data = filter(trajectory_imaging_long, biopsy_type == "Initial"),
+    aes(x = years_from_meno, y = pace_index, fill = biopsy_age),
+    shape  = 21,
+    size   = 5,
+    alpha  = 0.9,
+    color  = "black",
+    stroke = 0.5
+  ) +
+  # Subsequent biopsy points (open triangles, black outline)
+  geom_point(
+    data = filter(trajectory_imaging_long, biopsy_type == "Subsequent"),
+    aes(x = years_from_meno, y = pace_index),
+    shape  = 24,
+    size   = 4,
+    fill   = NA,
+    color  = "black",
+    stroke = 1.2,
+    alpha  = 0.9
+  ) +
+  # Reference lines
+  geom_vline(xintercept = 0, linetype = "dashed", color = accent_color,
+             linewidth = 0.8, alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = accent_color,
+             linewidth = 0.6, alpha = 0.6) +
+  # Continuous age color scale
+  scale_fill_viridis_c(
+    name   = "Age at initial\nbiopsy (years)",
+    option = "plasma",
+    begin  = 0.15,
+    end    = 0.95,
+    guide  = guide_colorbar(
+      title.position = "top", title.hjust = 0.5,
+      barwidth = 1.2, barheight = 12,
+      frame.colour = accent_color, ticks.colour = accent_color
+    )
+  ) +
+  scale_x_continuous(
+    breaks = seq(-10, 25, 2),
+    limits = c(-10, 25),
+    expand = c(0.02, 0)
+  ) +
+  scale_y_continuous(
+    limits = y_limits_img,
+    breaks = pretty_breaks(n = 8),
+    expand = c(0.02, 0)
+  ) +
+  labs(
+    x        = "Years from menopause\n(negative = pre-menopausal, positive = post-menopausal)",
+    y        = "Involution pace (log units/year)",
+    title    = "Involution Trajectories: Imaging Subset",
+    subtitle = sprintf(
+      "Paired biopsies from %d women | Lines connect same woman over time\nCircles = initial biopsy, Triangles = subsequent biopsy",
+      nrow(trajectory_imaging)
+    )
+  ) +
+  theme_trajectory +
+  # Override legend text size for this panel
+  theme(
+    plot.title = element_text(face = "bold", size = 28, hjust = 0.5,
+                               margin = margin(b = 8)),
+    plot.subtitle = element_text(size = 18, hjust = 0.5, lineheight = 1.2,
+                                  margin = margin(b = 15)),
+    legend.title = element_text(face = "bold", size = 18, color = text_color),
+    legend.text  = element_text(size = 18, color = text_color)
+  )
+
+print(supp_s3a)
+
+
+cat("\n\u2713 Figures 3A, 3B, and S3A generated successfully.\n")
+
+# ============================================================================
 # Figure 3C–F — Paired Biopsy Comparison (Initial vs Subsequent)
 # ============================================================================
 #
@@ -689,3 +1229,1101 @@ print(fig3e)
 print(fig3f)
 
 cat("\n\u2713 Figures 3C\u2013F generated successfully.\n")
+
+# ============================================================================
+# Figures 3G, 3H & Supplementary Figures S3B, S3C, S3D
+# Spatial Coupling and Immune Clustering Analyses
+# ============================================================================
+#
+# Description:
+#   This script generates five figures characterizing the spatial relationship
+#   between boundary stromal CD45⁺ immune cells and epithelial p16⁺ senescent
+#   cells in the subsequent biopsy cohort, stratified by menopausal trajectory
+#   and involution pace.
+#
+#   Fig 3G  — Complete20 metric: fraction of lobules where ALL boundary CD45⁺
+#             cells are within 20 µm of a p16⁺/CK⁺ senescent epithelial cell,
+#             modeled as a function of involution pace × menopausal trajectory.
+#   Fig 3H  — DBSCAN clustering: fraction of boundary CD45⁺ cells belonging
+#             to spatial clusters (eps = 12 µm, minPts = 5), modeled as a
+#             function of pace × trajectory.
+#   Supp S3B — Forest plot showing robustness of the Complete20 interaction
+#              estimate after adjusting for boundary CD45⁺ abundance.
+#   Supp S3C — Multi-radius density-adjusted coupling analysis (4 panels):
+#              predicted excess coupling at multiple radii, interaction
+#              significance curve, and integrated AUC metric.
+#   Supp S3D — DBSCAN parameter stability heatmaps across eps and minPts
+#              combinations.
+#
+# Prerequisite:
+#   Run "Figure3_data_preparation.R" first. This script expects:
+#     - subsequent_nn_data    (NN data with pace metrics merged)
+#     - subsequent_density    (density table with Annotation_ID, Tissue_Category,
+#                             Tissue_Area_um2)
+#
+# Dependencies:
+#   dplyr, tidyr, stringr, ggplot2, patchwork, scales,
+#   sandwich, lmtest, dbscan, RANN, pracma, readr
+# ============================================================================
+
+
+# ============================================================================
+# 0.  ADDITIONAL PACKAGES (beyond data prep script)
+# ============================================================================
+
+suppressPackageStartupMessages({
+  library(RANN)      # fast nearest-neighbor search (nn2)
+  library(pracma)    # trapezoidal integration (trapz)
+})
+
+
+# ============================================================================
+# 1.  SHARED AESTHETICS & HELPERS
+# ============================================================================
+
+text_color   <- "black"
+grid_color   <- "#E8E8E8"
+accent_color <- "#34495E"
+pre_color    <- "#3498DB"    # Blue  — Pre→Post menopausal trajectory
+post_color   <- "#E74C3C"    # Red   — Post→Post menopausal trajectory
+
+group_colors <- c("Pre-Menopause" = pre_color, "Post-Menopause" = post_color)
+
+# Reusable theme for interaction model plots (Figs 3G, 3H, S3B)
+theme_interaction <- theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 26, color = text_color,
+                                 hjust = 0.5, margin = margin(b = 8)),
+    plot.subtitle = element_text(size = 14, color = text_color, hjust = 0.5,
+                                 lineheight = 1.2, margin = margin(b = 15)),
+    plot.caption  = element_text(size = 12, color = text_color, hjust = 0,
+                                  face = "italic", margin = margin(t = 10),
+                                  lineheight = 1.2),
+    axis.title.x  = element_text(face = "bold", size = 24, color = text_color,
+                                  margin = margin(t = 10)),
+    axis.title.y  = element_text(face = "bold", size = 24, color = text_color,
+                                  margin = margin(r = 10), lineheight = 1.1),
+    axis.text     = element_text(size = 20, color = text_color),
+    axis.line     = element_line(color = accent_color, linewidth = 0.6),
+    panel.border  = element_rect(color = accent_color, fill = NA, linewidth = 0.8),
+    panel.grid.major = element_line(color = grid_color, linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.position    = "top",
+    legend.direction   = "horizontal",
+    legend.justification = "center",
+    legend.title       = element_text(face = "bold", size = 20, color = text_color,
+                                       lineheight = 1.1),
+    legend.text        = element_text(size = 20, color = text_color),
+    legend.key.size    = unit(1.5, "cm"),
+    legend.spacing.x   = unit(0.5, "cm"),
+    legend.margin      = margin(b = 10),
+    plot.margin        = margin(20, 20, 20, 20)
+  )
+
+# Reusable theme for supplementary multi-panel figures
+theme_supp_panel <- theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 24, color = text_color,
+                                 hjust = 0.5, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 20, color = text_color, hjust = 0.5,
+                                 margin = margin(b = 15)),
+    axis.title    = element_text(face = "bold", size = 22, color = text_color),
+    axis.title.x  = element_text(margin = margin(t = 10)),
+    axis.title.y  = element_text(margin = margin(r = 10), lineheight = 1.1),
+    axis.text     = element_text(size = 18, color = text_color),
+    axis.line     = element_line(color = accent_color, linewidth = 0.7),
+    panel.border  = element_rect(color = accent_color, fill = NA, linewidth = 0.9),
+    panel.grid.major = element_line(color = grid_color, linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.position  = "top",
+    legend.title     = element_text(face = "bold", size = 18, color = text_color),
+    legend.text      = element_text(size = 18, color = text_color),
+    plot.margin      = margin(20, 20, 20, 20)
+  )
+
+#' Population z-score (denominator uses N, not N-1)
+#' Used for standardizing pace_index and time-between-biopsies across women.
+z_pop <- function(x) {
+  mu    <- mean(x, na.rm = TRUE)
+  sigma <- sqrt(mean((x - mu)^2, na.rm = TRUE))
+  (x - mu) / sigma
+}
+
+#' Recode menopausal trajectory factor levels to display labels
+label_trajectory <- function(x) {
+  factor(x, levels = c("Pre-Post", "Post-Post"),
+         labels = c("Pre-Menopause", "Post-Menopause"))
+}
+
+
+# ============================================================================
+# 2.  FIGURE 3G — Complete20 (CD45⁺ → p16⁺/CK⁺ Interface Completeness)
+# ============================================================================
+# The Complete20 metric asks: for each lobule, are ALL boundary stromal CD45⁺
+# cells (within 20 µm of the epithelial edge) also within 20 µm of a
+# p16⁺/CK⁺ senescent epithelial cell? A lobule scores 1 if every boundary
+# CD45⁺ cell is coupled to a nearby senescent cell, 0 otherwise.
+#
+# We model Complete20 ~ pace_z * menopausal_trajectory + dt_z (logistic
+# regression with woman-clustered robust standard errors).
+
+cat("\n========================================\n")
+cat("  Figure 3G: Complete20 Analysis\n")
+cat("========================================\n")
+
+# ----------------------------------------------------------------------------
+# 2a. Compute Complete20 per lobule
+# ----------------------------------------------------------------------------
+# For each lobule, identify stromal CD45⁺ cells within 20 µm of the
+# epithelial edge ("boundary" cells), then check what fraction of those
+# are also within 20 µm of a p16⁺/CK⁺ target. Complete20 = 1 if that
+# fraction equals 1 (all boundary cells are coupled).
+
+complete20_lobule <- subsequent_nn_data %>%
+  mutate(
+    dist_edge  = as.numeric(`Distance from Tissue Category Edge (microns)`),
+    d_p16_ck   = as.numeric(`Distance to p16+/CK+`)
+  ) %>%
+  filter(
+    `Phenotype CD45` == "CD45+",
+    `Tissue Category` == "Stroma",
+    dist_edge <= 20
+  ) %>%
+  group_by(Patient_ID, `Annotation ID`) %>%
+  summarise(
+    n_boundary_cd45    = n(),
+    frac_coupled_20um  = mean(d_p16_ck <= 20, na.rm = TRUE),
+    Complete20         = as.integer(frac_coupled_20um == 1),
+    .groups = "drop"
+  )
+
+# ----------------------------------------------------------------------------
+# 2b. Exclude lobules that lack epithelial p16⁺/CK⁺ targets
+# ----------------------------------------------------------------------------
+# If a lobule has no senescent epithelial cells, the distance metric is
+# undefined. These lobules are removed to avoid artifactual zeros.
+
+lobules_with_p16 <- subsequent_nn_data %>%
+  filter(`Phenotype p16` == "p16+", `Phenotype CK` == "CK+") %>%
+  group_by(Patient_ID, `Annotation ID`) %>%
+  summarise(has_p16 = TRUE, .groups = "drop")
+
+complete20_lobule <- complete20_lobule %>%
+  left_join(lobules_with_p16, by = c("Patient_ID", "Annotation ID")) %>%
+  filter(has_p16 == TRUE)
+
+# ----------------------------------------------------------------------------
+# 2c. Merge covariates and standardize
+# ----------------------------------------------------------------------------
+# pace_z: standardized involution pace (positive = faster involution)
+# dt_z:   standardized time between biopsies (covariate control)
+
+patient_covariates <- subsequent_nn_data %>%
+  select(Patient_ID, pace_index, years_to_meno_sub,
+         years_to_meno_init, meno.3group) %>%
+  distinct()
+
+complete20_lobule <- complete20_lobule %>%
+  left_join(patient_covariates, by = "Patient_ID") %>%
+  mutate(
+    pace_z      = as.numeric(scale(pace_index)),
+    dt_z        = as.numeric(scale(years_to_meno_sub - years_to_meno_init)),
+    meno.3group = factor(meno.3group, levels = c("Pre-Post", "Post-Post"))
+  )
+
+# ----------------------------------------------------------------------------
+# 2d. Fit logistic regression with woman-clustered robust SEs
+# ----------------------------------------------------------------------------
+model_complete20 <- glm(
+  Complete20 ~ pace_z * meno.3group + dt_z,
+  family = binomial(),
+  data   = complete20_lobule
+)
+
+vcov_c20 <- vcovCL(model_complete20, cluster = complete20_lobule$Patient_ID)
+ct_c20   <- coeftest(model_complete20, vcov = vcov_c20)
+
+interaction_p_c20 <- ct_c20["pace_z:meno.3groupPost-Post", "Pr(>|z|)"]
+
+cat("  Model coefficients (cluster-robust):\n")
+print(ct_c20)
+cat(sprintf("\n  Interaction p = %.4f\n", interaction_p_c20))
+
+# ----------------------------------------------------------------------------
+# 2e. Generate prediction grid with 95% confidence intervals
+# ----------------------------------------------------------------------------
+grid_c20 <- expand.grid(
+  pace_z      = seq(min(complete20_lobule$pace_z, na.rm = TRUE),
+                    max(complete20_lobule$pace_z, na.rm = TRUE),
+                    length.out = 200),
+  meno.3group = levels(complete20_lobule$meno.3group),
+  dt_z        = 0
+)
+
+pred_c20 <- predict(model_complete20, newdata = grid_c20, se.fit = TRUE, type = "link")
+
+grid_c20 <- grid_c20 %>%
+  mutate(
+    fit       = pred_c20$fit,
+    se        = pred_c20$se.fit,
+    pred      = plogis(fit),
+    pred_low  = plogis(fit - 1.96 * se),
+    pred_high = plogis(fit + 1.96 * se),
+    traj_label = label_trajectory(meno.3group)
+  )
+
+# Per-woman observed fraction for overlay points
+pts_c20 <- complete20_lobule %>%
+  group_by(Patient_ID, meno.3group) %>%
+  summarise(
+    pace_z          = first(pace_z),
+    frac_complete20 = mean(Complete20),
+    .groups = "drop"
+  ) %>%
+  mutate(traj_label = label_trajectory(meno.3group))
+
+# ----------------------------------------------------------------------------
+# 2f. Plot Figure 3G
+# ----------------------------------------------------------------------------
+fig3g <- ggplot(grid_c20, aes(x = pace_z, y = pred,
+                               color = traj_label, fill = traj_label)) +
+  # 95% CI ribbons from logistic model predictions
+  geom_ribbon(aes(ymin = pred_low, ymax = pred_high), alpha = 0.25, color = NA) +
+  # Predicted probability curves
+  geom_line(linewidth = 1.8, alpha = 0.9) +
+  # Observed per-woman fractions
+  geom_point(
+    data = pts_c20,
+    aes(x = pace_z, y = frac_complete20, color = traj_label),
+    size = 3.5, alpha = 0.7, inherit.aes = FALSE
+  ) +
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values  = group_colors) +
+  scale_x_continuous(breaks = pretty_breaks(n = 8), expand = expansion(mult = 0.02)) +
+  scale_y_continuous(
+    breaks = pretty_breaks(n = 8), limits = c(0, 0.5),
+    labels = percent_format(accuracy = 1), expand = expansion(mult = 0.02)
+  ) +
+  # Interaction p-value annotation
+  annotate("text", x = Inf, y = Inf,
+           label = sprintf("Interaction p = %s", signif(interaction_p_c20, 3)),
+           hjust = 1.05, vjust = 1.2, size = 5.5,
+           color = text_color, fontface = "bold") +
+  labs(
+    x       = "Involution Pace (z-score)",
+    y       = "Fraction of Lobules with\nComplete CD45\u207A \u2192 p16\u207A Interface",
+    color   = "Menopausal\nTrajectory",
+    fill    = "Menopausal\nTrajectory",
+    caption = paste0(
+      "Woman-clustered standard errors\n",
+      "Complete20 = all boundary CD45\u207A cells within 20 \u00B5m of p16\u207A/CK\u207A"
+    )
+  ) +
+  theme_interaction
+
+print(fig3g)
+
+
+# ============================================================================
+# 3.  FIGURE 3H — Boundary CD45⁺ Spatial Clustering (DBSCAN)
+# ============================================================================
+# Uses DBSCAN to identify spatial clusters among boundary stromal CD45⁺ cells
+# (those within 20 µm of a CK⁺ epithelial cell). The clustering fraction is
+# the proportion of boundary CD45⁺ cells assigned to any cluster (vs noise).
+# Modeled with OLS and woman-clustered robust SEs.
+
+cat("\n========================================\n")
+cat("  Figure 3H: DBSCAN Clustering Analysis\n")
+cat("========================================\n")
+
+# ----------------------------------------------------------------------------
+# 3a. Build lobule-level covariate frame (all lobules, including those
+#     with zero boundary CD45⁺ cells)
+# ----------------------------------------------------------------------------
+lobule_covariates <- subsequent_nn_data %>%
+  distinct(Patient_ID, `Annotation ID`, pace_index,
+           years_to_meno_sub, years_to_meno_init, meno.3group) %>%
+  filter(meno.3group %in% c("Pre-Post", "Post-Post")) %>%
+  mutate(
+    years_between = years_to_meno_sub - years_to_meno_init,
+    pace_z        = as.numeric(scale(pace_index)),
+    dt_z          = as.numeric(scale(years_between)),
+    meno.3group   = factor(meno.3group, levels = c("Pre-Post", "Post-Post"))
+  )
+
+# ----------------------------------------------------------------------------
+# 3b. Identify boundary CD45⁺ cells (stromal, ≤20 µm from CK⁺ epithelium)
+# ----------------------------------------------------------------------------
+boundary_cd45_3h <- subsequent_nn_data %>%
+  filter(
+    `Phenotype CD45` == "CD45+",
+    `Tissue Category` == "Stroma",
+    `Distance to CK+` <= 20
+  ) %>%
+  select(Patient_ID, `Annotation ID`,
+         `Cell X Position`, `Cell Y Position`)
+
+# ----------------------------------------------------------------------------
+# 3c. Run DBSCAN per lobule (eps = 12 µm, minPts = 5)
+# ----------------------------------------------------------------------------
+# For lobules with < minPts boundary cells, clustering is undefined →
+# cluster_frac = 0.
+
+dbscan_results <- boundary_cd45_3h %>%
+  group_by(Patient_ID, `Annotation ID`) %>%
+  summarise(
+    coords      = list(cbind(`Cell X Position`, `Cell Y Position`)),
+    n_boundary  = n(),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    cluster_frac = ifelse(
+      n_boundary < 5,
+      0,
+      sum(dbscan(coords, eps = 12, minPts = 5)$cluster > 0) / n_boundary
+    )
+  ) %>%
+  ungroup() %>%
+  select(Patient_ID, `Annotation ID`, cluster_frac)
+
+# ----------------------------------------------------------------------------
+# 3d. Merge clustering fraction to all lobules (0 for lobules without
+#     boundary CD45⁺ cells)
+# ----------------------------------------------------------------------------
+lobule_cluster <- lobule_covariates %>%
+  left_join(dbscan_results, by = c("Patient_ID", "Annotation ID")) %>%
+  mutate(cluster_frac = replace_na(cluster_frac, 0))
+
+# ----------------------------------------------------------------------------
+# 3e. OLS model with woman-clustered robust SEs
+# ----------------------------------------------------------------------------
+model_cluster <- lm(cluster_frac ~ pace_z * meno.3group + dt_z,
+                    data = lobule_cluster)
+
+vcov_cl <- vcovCL(model_cluster, cluster = lobule_cluster$Patient_ID)
+ct_cl   <- coeftest(model_cluster, vcov = vcov_cl)
+
+interaction_p_cl <- ct_cl["pace_z:meno.3groupPost-Post", "Pr(>|t|)"]
+
+cat("  Model coefficients (cluster-robust):\n")
+print(ct_cl)
+cat(sprintf("\n  Interaction p = %.4f\n", interaction_p_cl))
+
+# ----------------------------------------------------------------------------
+# 3f. Per-woman means and prediction grid
+# ----------------------------------------------------------------------------
+pts_cluster <- lobule_cluster %>%
+  group_by(Patient_ID, meno.3group) %>%
+  summarise(
+    pace_z       = first(pace_z),
+    frac_cluster = mean(cluster_frac, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(traj_label = label_trajectory(meno.3group))
+
+grid_cl <- expand.grid(
+  pace_z      = seq(min(lobule_cluster$pace_z, na.rm = TRUE),
+                    max(lobule_cluster$pace_z, na.rm = TRUE),
+                    length.out = 200),
+  meno.3group = levels(lobule_cluster$meno.3group),
+  dt_z        = 0
+)
+
+pred_cl <- predict(model_cluster, newdata = grid_cl, se.fit = TRUE)
+
+grid_cl <- grid_cl %>%
+  mutate(
+    pred       = pred_cl$fit,
+    se         = pred_cl$se.fit,
+    pred_low   = pred - 1.96 * se,
+    pred_high  = pred + 1.96 * se,
+    traj_label = label_trajectory(meno.3group)
+  )
+
+# ----------------------------------------------------------------------------
+# 3g. Plot Figure 3H
+# ----------------------------------------------------------------------------
+fig3h <- ggplot(grid_cl, aes(x = pace_z, y = pred,
+                              color = traj_label, fill = traj_label)) +
+  geom_ribbon(aes(ymin = pred_low, ymax = pred_high), alpha = 0.25, color = NA) +
+  geom_line(linewidth = 1.8, alpha = 0.9) +
+  geom_point(
+    data = pts_cluster,
+    aes(x = pace_z, y = frac_cluster, color = traj_label),
+    size = 3.5, alpha = 0.7, inherit.aes = FALSE
+  ) +
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values  = group_colors) +
+  scale_x_continuous(breaks = pretty_breaks(n = 8), expand = expansion(mult = 0.02)) +
+  scale_y_continuous(breaks = pretty_breaks(n = 8),
+                     labels = percent_format(accuracy = 1),
+                     expand = expansion(mult = 0.02)) +
+  annotate("text", x = Inf, y = Inf,
+           label = sprintf("Interaction p = %s", signif(interaction_p_cl, 3)),
+           hjust = 1.05, vjust = 1.02, size = 5,
+           color = text_color, fontface = "bold") +
+  labs(
+    x        = "Involution Pace (z-score)",
+    y        = "Boundary CD45\u207A Clustering Fraction",
+    color    = "Menopausal\nTrajectory",
+    fill     = "Menopausal\nTrajectory",
+    title    = "Boundary CD45\u207A Clustering",
+    subtitle = "DBSCAN clustering (eps = 12 \u00B5m, minPts = 5)",
+    caption  = paste0(
+      "Woman-clustered standard errors\n",
+      "Each point = one woman\u2019s mean clustering fraction\n",
+      "Boundary CD45\u207A = stromal CD45\u207A cells \u226420 \u00B5m from CK\u207A"
+    )
+  ) +
+  theme_interaction
+
+print(fig3h)
+
+
+# ============================================================================
+# 4.  SUPP FIG S3B — Complete20 Interaction Robustness (Forest Plot)
+# ============================================================================
+# Tests whether the pace × trajectory interaction in the Complete20 model
+# remains significant after adjusting for boundary CD45⁺ abundance
+# (log-transformed count). Presented as a horizontal forest plot.
+
+cat("\n========================================\n")
+cat("  Supp Fig S3B: Complete20 Robustness\n")
+cat("========================================\n")
+
+# ----------------------------------------------------------------------------
+# 4a. Add log-transformed boundary CD45⁺ count as a covariate
+# ----------------------------------------------------------------------------
+complete20_adj <- complete20_lobule %>%
+  mutate(log_n_boundary = log1p(n_boundary_cd45))
+
+# Base model (same as Fig 3G)
+model_base <- glm(Complete20 ~ pace_z * meno.3group + dt_z,
+                  family = binomial(), data = complete20_adj)
+
+# Adjusted model (controls for boundary CD45⁺ abundance)
+model_adj <- glm(Complete20 ~ pace_z * meno.3group + dt_z + log_n_boundary,
+                 family = binomial(), data = complete20_adj)
+
+# Woman-clustered robust inference
+vcov_base <- vcovCL(model_base, cluster = complete20_adj$Patient_ID)
+vcov_adj  <- vcovCL(model_adj,  cluster = complete20_adj$Patient_ID)
+ct_base   <- coeftest(model_base, vcov = vcov_base)
+ct_adj    <- coeftest(model_adj,  vcov = vcov_adj)
+
+# ----------------------------------------------------------------------------
+# 4b. Extract interaction estimates for both models
+# ----------------------------------------------------------------------------
+robustness_results <- tibble(
+  model               = c("Base", "Adjusted"),
+  interaction_logodds = c(
+    ct_base["pace_z:meno.3groupPost-Post", "Estimate"],
+    ct_adj ["pace_z:meno.3groupPost-Post", "Estimate"]
+  ),
+  se = c(
+    ct_base["pace_z:meno.3groupPost-Post", "Std. Error"],
+    ct_adj ["pace_z:meno.3groupPost-Post", "Std. Error"]
+  ),
+  p = c(
+    ct_base["pace_z:meno.3groupPost-Post", "Pr(>|z|)"],
+    ct_adj ["pace_z:meno.3groupPost-Post", "Pr(>|z|)"]
+  )
+)
+
+cat("  Robustness comparison:\n")
+print(robustness_results)
+
+write_csv(robustness_results, file.path(OUT_DIR, "SuppS3B_robustness_results.csv"))
+
+# ----------------------------------------------------------------------------
+# 4c. Plot Supp Fig S3B (forest plot)
+# ----------------------------------------------------------------------------
+supp_s3b <- ggplot(robustness_results,
+                   aes(x = interaction_logodds, y = factor(model))) +
+  # Null hypothesis line (interaction = 0)
+  geom_vline(xintercept = 0, linetype = "dashed", color = post_color,
+             linewidth = 0.8) +
+  # 95% CI error bars
+  geom_errorbarh(
+    aes(xmin = interaction_logodds - 1.96 * se,
+        xmax = interaction_logodds + 1.96 * se),
+    height = 0.2, linewidth = 1.2, color = post_color, alpha = 0.8
+  ) +
+  # Point estimates (diamonds)
+  geom_point(size = 6, color = post_color, shape = 18) +
+  # P-value labels
+  geom_text(
+    aes(label = sprintf("p = %.4f", p)),
+    vjust = -1.0, hjust = -0.15, size = 4,
+    color = text_color, fontface = "bold"
+  ) +
+  scale_x_continuous(breaks = pretty_breaks(n = 8),
+                     expand = expansion(mult = c(0.1, 0.15))) +
+  labs(
+    x        = "Interaction Estimate (log-odds)\nPace \u00D7 Trajectory",
+    y        = "",
+    title    = "Complete20 Pace \u00D7 Trajectory Interaction",
+    subtitle = "Interaction remains significant after adjusting for boundary CD45\u207A abundance",
+    caption  = "Woman-clustered standard errors | Base model adjusted for time between biopsies"
+  ) +
+  theme_interaction +
+  theme(
+    axis.title.x = element_text(face = "bold", size = 18, lineheight = 1.1),
+    axis.title.y = element_blank(),
+    axis.text.x  = element_text(size = 24),
+    axis.text.y  = element_text(size = 18, face = "bold"),
+    legend.position = "none"
+  )
+
+print(supp_s3b)
+
+
+# ============================================================================
+# 5.  SUPP FIG S3C — Multi-Radius Density-Adjusted Coupling (4 Panels)
+# ============================================================================
+# Tests whether the spatial co-localization of boundary CD45⁺ cells with
+# epithelial p16⁺ cells exceeds what would be expected under complete spatial
+# randomness (CSR), and whether this excess depends on pace × trajectory.
+#
+# EXCESS(r) = CF_observed(r) - CF_CSR(r)
+# where CF(r) = fraction of boundary CD45⁺ within radius r of nearest p16⁺,
+# and CF_CSR uses the Poisson-disc null based on epithelial p16⁺ density (λ).
+
+cat("\n========================================\n")
+cat("  Supp Fig S3C: Density-Adjusted Coupling\n")
+cat("========================================\n")
+
+radii_show <- c(5, 10, 15, 20, 25, 30)
+radii_all  <- 0:30
+
+# ----------------------------------------------------------------------------
+# 5a. Compute epithelial p16⁺ density (λ) per lobule
+# ----------------------------------------------------------------------------
+# λ = (number of epithelial p16⁺ cells) / (epithelial tissue area in mm²)
+# Used for the CSR null expectation at each radius.
+
+epi_area <- subsequent_density %>%
+  filter(Tissue_Category == "Epithelial") %>%
+  transmute(Annotation_ID, epi_area_um2 = Tissue_Area_um2)
+
+p16_counts <- subsequent_nn_data %>%
+  filter(`Phenotype p16` == "p16+", `Tissue Category` == "Epithelial") %>%
+  group_by(`Annotation ID`) %>%
+  summarise(p16_epi_n = n(), .groups = "drop") %>%
+  rename(Annotation_ID = `Annotation ID`)
+
+lambda_df <- epi_area %>%
+  left_join(p16_counts, by = "Annotation_ID") %>%
+  mutate(
+    p16_epi_n      = replace_na(p16_epi_n, 0),
+    epi_area_mm2   = epi_area_um2 / 1e6,
+    lambda_p16_epi = p16_epi_n / epi_area_mm2
+  )
+
+cat(sprintf("  Lambda computed for %d lobules\n", nrow(lambda_df)))
+
+# ----------------------------------------------------------------------------
+# 5b. Define boundary CD45⁺ sources (stromal, ≤20 µm from epithelial edge)
+# ----------------------------------------------------------------------------
+boundary_cd45_s3c <- subsequent_nn_data %>%
+  filter(
+    `Phenotype CD45` == "CD45+",
+    `Tissue Category` == "Stroma",
+    !is.na(`Distance from Tissue Category Edge (microns)`),
+    as.numeric(`Distance from Tissue Category Edge (microns)`) <= 20
+  ) %>%
+  select(`Annotation ID`, Patient_ID, pace_index,
+         years_to_meno_sub, years_to_meno_init, meno.3group,
+         x = `Cell X Position`, y = `Cell Y Position`) %>%
+  mutate(x = as.numeric(x), y = as.numeric(y))
+
+# ----------------------------------------------------------------------------
+# 5c. Define epithelial p16⁺ targets
+# ----------------------------------------------------------------------------
+epi_p16_targets <- subsequent_nn_data %>%
+  filter(`Phenotype p16` == "p16+", `Tissue Category` == "Epithelial") %>%
+  select(`Annotation ID`, x = `Cell X Position`, y = `Cell Y Position`) %>%
+  mutate(x = as.numeric(x), y = as.numeric(y))
+
+# Pre-split targets by lobule for fast lookup
+target_list <- split(epi_p16_targets[, c("x", "y")],
+                     epi_p16_targets$`Annotation ID`)
+
+# ----------------------------------------------------------------------------
+# 5d. Compute nearest-neighbor distance from each boundary CD45⁺ cell to
+#     its closest epithelial p16⁺ cell (using RANN::nn2 for speed)
+# ----------------------------------------------------------------------------
+cat("  Computing nearest-neighbor distances...\n")
+
+sources_with_dist <- boundary_cd45_s3c %>%
+  group_by(`Annotation ID`) %>%
+  group_modify(~ {
+    ann     <- .y$`Annotation ID`
+    targets <- target_list[[as.character(ann)]]
+    if (is.null(targets) || nrow(targets) == 0) {
+      .x %>% mutate(d_epi_p16 = Inf)
+    } else {
+      nn_result <- nn2(data  = as.matrix(targets),
+                       query = as.matrix(.x[, c("x", "y")]),
+                       k = 1)
+      .x %>% mutate(d_epi_p16 = nn_result$nn.dists[, 1])
+    }
+  }) %>%
+  ungroup()
+
+# ----------------------------------------------------------------------------
+# 5e. Compute EXCESS(r) = CF_obs(r) - CF_CSR(r) per lobule at each radius
+# ----------------------------------------------------------------------------
+cat("  Computing EXCESS(r) at each radius...\n")
+
+dist_list <- split(sources_with_dist$d_epi_p16,
+                   sources_with_dist$`Annotation ID`)
+
+cf_at_r <- function(d, r) mean(d <= r)
+
+excess_long <- lapply(names(dist_list), function(ann) {
+  d   <- dist_list[[ann]]
+  row <- sources_with_dist %>% filter(`Annotation ID` == ann) %>% slice(1)
+  lam <- lambda_df %>% filter(Annotation_ID == ann) %>% pull(lambda_p16_epi)
+  if (length(lam) == 0) lam <- 0
+
+  tibble(
+    `Annotation ID`    = ann,
+    Patient_ID         = row$Patient_ID,
+    meno.3group        = row$meno.3group,
+    pace_index         = row$pace_index,
+    years_to_meno_sub  = row$years_to_meno_sub,
+    years_to_meno_init = row$years_to_meno_init,
+    radius  = radii_show,
+    CF_obs  = sapply(radii_show, function(r) cf_at_r(d, r)),
+    lambda  = lam,
+    CF_CSR  = sapply(radii_show, function(r) 1 - exp(-lam * pi * (r / 1000)^2)),
+    EXCESS  = CF_obs - CF_CSR
+  )
+}) %>%
+  bind_rows() %>%
+  filter(meno.3group %in% c("Pre-Post", "Post-Post"))
+
+# Add standardized variables (population z-scores across women)
+woman_meta_s3c <- excess_long %>%
+  group_by(Patient_ID) %>%
+  summarise(pace_index = first(pace_index),
+            years_to_meno_sub = first(years_to_meno_sub),
+            years_to_meno_init = first(years_to_meno_init),
+            .groups = "drop") %>%
+  mutate(pace_z = z_pop(pace_index),
+         dt_z   = z_pop(years_to_meno_sub - years_to_meno_init))
+
+excess_long <- excess_long %>%
+  left_join(woman_meta_s3c %>% select(Patient_ID, pace_z, dt_z),
+            by = "Patient_ID")
+
+# ----------------------------------------------------------------------------
+# 5f. Fit interaction model at each radius → predictions and p-values
+# ----------------------------------------------------------------------------
+cat("  Fitting radius-specific models...\n")
+
+cluster_vcov <- function(fit, dat) vcovCL(fit, cluster = dat$Patient_ID, type = "HC1")
+robust_z_p   <- function(beta, se) 2 * (1 - pnorm(abs(beta / se)))
+
+pred_rows <- list()
+p_rows    <- list()
+
+for (r in radii_show) {
+  df_r <- excess_long %>%
+    filter(radius == r) %>%
+    mutate(PostPost = as.integer(meno.3group == "Post-Post"))
+
+  model_r <- lm(EXCESS ~ pace_z * PostPost + dt_z, data = df_r)
+  V_r     <- cluster_vcov(model_r, df_r)
+
+  b_int  <- coef(model_r)["pace_z:PostPost"]
+  se_int <- sqrt(V_r["pace_z:PostPost", "pace_z:PostPost"])
+  p_int  <- robust_z_p(b_int, se_int)
+
+  cat(sprintf("    Radius %2d \u00B5m: interaction p = %.4f\n", r, p_int))
+
+  p_rows[[length(p_rows) + 1]] <- tibble(
+    radius = r, beta3 = b_int, se = se_int,
+    p_int = p_int, neglog10_p = -log10(p_int)
+  )
+
+  # Predicted EXCESS at pace_z = ±1 for each trajectory group
+  b <- coef(model_r)
+  for (grp in c("Pre-Post", "Post-Post")) {
+    post <- ifelse(grp == "Post-Post", 1, 0)
+    for (pz in c(-1, 1)) {
+      eta <- b["(Intercept)"] + b["pace_z"] * pz + b["PostPost"] * post +
+             b["pace_z:PostPost"] * pz * post + b["dt_z"] * 0
+      pred_rows[[length(pred_rows) + 1]] <- tibble(
+        radius = r, group = grp, pace_z = pz, pred_EXCESS = eta
+      )
+    }
+  }
+}
+
+pred_curve <- bind_rows(pred_rows)
+p_curve    <- bind_rows(p_rows)
+
+# ----------------------------------------------------------------------------
+# 5g. Compute AUC₀₋₃₀(EXCESS) per lobule via trapezoidal integration
+# ----------------------------------------------------------------------------
+cat("  Computing AUC(EXCESS)...\n")
+
+auc_lobule <- lapply(names(dist_list), function(ann) {
+  d   <- dist_list[[ann]]
+  lam <- lambda_df %>% filter(Annotation_ID == ann) %>% pull(lambda_p16_epi)
+  if (length(lam) == 0) lam <- 0
+
+  cf  <- sapply(radii_all, function(r) cf_at_r(d, r))
+  csr <- sapply(radii_all, function(r) 1 - exp(-lam * pi * (r / 1000)^2))
+  ex  <- cf - csr
+
+  tibble(`Annotation ID` = ann,
+         AUC_raw  = trapz(c(0, radii_all), c(0, ex)),
+         AUC_norm = trapz(c(0, radii_all), c(0, ex)) / 30)
+}) %>%
+  bind_rows()
+
+# Merge metadata and fit AUC interaction model
+auc_lobule <- sources_with_dist %>%
+  select(`Annotation ID`, Patient_ID, meno.3group,
+         pace_index, years_to_meno_sub, years_to_meno_init) %>%
+  distinct() %>%
+  left_join(auc_lobule, by = "Annotation ID") %>%
+  filter(meno.3group %in% c("Pre-Post", "Post-Post")) %>%
+  left_join(woman_meta_s3c %>% select(Patient_ID, pace_z, dt_z),
+            by = "Patient_ID") %>%
+  mutate(PostPost = as.integer(meno.3group == "Post-Post"))
+
+model_auc <- lm(AUC_norm ~ pace_z * PostPost + dt_z, data = auc_lobule)
+V_auc     <- cluster_vcov(model_auc, auc_lobule)
+b_int_auc <- coef(model_auc)["pace_z:PostPost"]
+se_auc    <- sqrt(V_auc["pace_z:PostPost", "pace_z:PostPost"])
+p_auc_int <- robust_z_p(b_int_auc, se_auc)
+
+cat(sprintf("  AUC interaction p = %.4f\n", p_auc_int))
+
+# AUC prediction curves
+b_auc    <- coef(model_auc)
+pace_seq <- seq(min(auc_lobule$pace_z), max(auc_lobule$pace_z), length.out = 200)
+
+pred_auc <- rbind(
+  tibble(pace_z = pace_seq, PostPost = 0, group = "Pre-Post"),
+  tibble(pace_z = pace_seq, PostPost = 1, group = "Post-Post")
+) %>%
+  mutate(dt_z = 0,
+         y = b_auc["(Intercept)"] + b_auc["pace_z"] * pace_z +
+             b_auc["PostPost"] * PostPost +
+             b_auc["pace_z:PostPost"] * pace_z * PostPost +
+             b_auc["dt_z"] * dt_z)
+
+# Per-woman mean AUC for overlay points
+auc_woman <- auc_lobule %>%
+  group_by(Patient_ID, meno.3group, pace_z) %>%
+  summarise(AUC_norm = mean(AUC_norm, na.rm = TRUE), .groups = "drop")
+
+# ----------------------------------------------------------------------------
+# 5h. Build four panels for Supp Fig S3C
+# ----------------------------------------------------------------------------
+cat("  Building S3C panels...\n")
+
+# Colors for pace contrast lines
+col_pace_low  <- "#2166AC"   # Dark blue  (slow pace, z = -1)
+col_pace_high <- "#B2182B"   # Dark red   (fast pace, z = +1)
+
+# Panel A: Pre→Post predicted EXCESS across radii
+panel_a <- ggplot(pred_curve %>% filter(group == "Pre-Post"),
+                  aes(x = radius, y = pred_EXCESS, color = factor(pace_z))) +
+  geom_line(linewidth = 1.8, alpha = 0.9) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c("-1" = col_pace_low, "1" = col_pace_high),
+                     labels = c("-1" = "Slow Pace (z = \u22121)",
+                                "1"  = "Fast Pace (z = +1)")) +
+  scale_x_continuous(breaks = radii_show, expand = expansion(mult = 0.02)) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = 0.08)) +
+  labs(x = "Radius (\u00B5m)", y = "Predicted EXCESS\n(Density-Adjusted Coupling)",
+       title = "Multi-radius CD45\u207A \u2192 p16\u207A Coupling",
+       subtitle = "Pre-Menopause", color = "Involution Pace") +
+  theme_supp_panel
+
+# Panel B: Post→Post predicted EXCESS across radii
+panel_b <- ggplot(pred_curve %>% filter(group == "Post-Post"),
+                  aes(x = radius, y = pred_EXCESS, color = factor(pace_z))) +
+  geom_line(linewidth = 1.8, alpha = 0.9) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c("-1" = col_pace_low, "1" = col_pace_high),
+                     labels = c("-1" = "Slow Pace (z = \u22121)",
+                                "1"  = "Fast Pace (z = +1)")) +
+  scale_x_continuous(breaks = radii_show, expand = expansion(mult = 0.02)) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = 0.08)) +
+  labs(x = "Radius (\u00B5m)", y = "Predicted EXCESS\n(Density-Adjusted Coupling)",
+       title = "Multi-radius CD45\u207A \u2192 p16\u207A Coupling",
+       subtitle = "Post-Menopause", color = "Involution Pace") +
+  theme_supp_panel
+
+# Panel C: Interaction p-value across radii
+panel_c <- ggplot(p_curve, aes(x = radius, y = neglog10_p)) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+             color = post_color, linewidth = 1) +
+  geom_line(linewidth = 1.8, color = accent_color, alpha = 0.9) +
+  geom_point(size = 4, color = accent_color) +
+  scale_x_continuous(breaks = radii_show, expand = expansion(mult = 0.02)) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = 0.08)) +
+  labs(x = "Radius (\u00B5m)",
+       y = expression(bold(-log[10](italic(p)[interaction]))),
+       title = "Interaction Significance Across Distance Thresholds",
+       subtitle = "Red line = p = 0.05") +
+  theme_supp_panel +
+  theme(plot.subtitle = element_text(size = 16))
+
+# Panel D: Integrated AUC scatter plot (one dot per woman)
+panel_d <- ggplot() +
+  geom_line(data = pred_auc,
+            aes(x = pace_z, y = y, color = group),
+            linewidth = 1.8, alpha = 0.9) +
+  geom_point(data = auc_woman,
+             aes(x = pace_z, y = AUC_norm, color = meno.3group),
+             size = 4, alpha = 0.75) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "gray50",
+             linewidth = 0.8) +
+  scale_color_manual(
+    values = c("Pre-Post" = pre_color, "Post-Post" = post_color),
+    labels = c("Pre-Post" = "Pre-Menopause", "Post-Post" = "Post-Menopause")
+  ) +
+  scale_x_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = 0.08)) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6), expand = expansion(mult = 0.08)) +
+  labs(x = "Involution Pace (z-score)",
+       y = expression(bold("AUC"[0-30] * "(EXCESS) / 30")),
+       color = "Menopausal\nTrajectory",
+       title = "Integrated Coupling Metric (AUC)",
+       subtitle = sprintf("Pace \u00D7 Trajectory | Interaction p = %.2f", p_auc_int)) +
+  theme_supp_panel
+
+# Combine into a 2×2 layout
+fig_s3c <- (panel_a + theme(legend.position = "bottom") |
+            panel_b + theme(legend.position = "none")) /
+           (panel_c + theme(plot.subtitle = element_blank()) |
+            panel_d + theme(legend.position = c(0.75, 0.2),
+                            legend.background = element_rect(fill = "white",
+                                                             color = "gray50"))) +
+  plot_annotation(
+    title    = "Supplementary Figure S3C: Density-Adjusted Coupling Analysis",
+    subtitle = "Boundary CD45\u207A \u2192 Epithelial p16\u207A coupling robustness across distance thresholds",
+    theme    = theme(
+      plot.title    = element_text(face = "bold", hjust = 0.5, size = 18,
+                                    color = text_color, margin = margin(b = 5)),
+      plot.subtitle = element_text(hjust = 0.5, size = 13,
+                                    color = text_color, margin = margin(b = 15))
+    )
+  )
+
+# Print all panels individually and combined
+print(panel_a); print(panel_b); print(panel_c); print(panel_d)
+print(fig_s3c)
+
+
+# ============================================================================
+# 6.  SUPP FIG S3D — DBSCAN Parameter Stability Heatmaps
+# ============================================================================
+# Sweeps over a grid of DBSCAN parameters (eps × minPts) and re-fits the
+# pace × trajectory interaction model at each combination. Demonstrates
+# robustness of the clustering result to parameter choice.
+
+cat("\n========================================\n")
+cat("  Supp Fig S3D: DBSCAN Parameter Stability\n")
+cat("========================================\n")
+
+# ----------------------------------------------------------------------------
+# 6a. Define parameter grid
+# ----------------------------------------------------------------------------
+eps_values  <- c(8, 10, 12, 14)
+minpts_values <- c(4, 5, 6)
+
+# ----------------------------------------------------------------------------
+# 6b. Build lobule-level metadata with standardized covariates
+# ----------------------------------------------------------------------------
+lobule_meta_s3d <- subsequent_nn_data %>%
+  select(`Annotation ID`, Patient_ID, pace_index,
+         years_to_meno_sub, years_to_meno_init, meno.3group) %>%
+  distinct() %>%
+  filter(meno.3group %in% c("Pre-Post", "Post-Post"))
+
+woman_meta_s3d <- lobule_meta_s3d %>%
+  group_by(Patient_ID) %>%
+  summarise(
+    pace_index = first(pace_index),
+    meno.3group = first(meno.3group),
+    years_to_meno_sub = first(years_to_meno_sub),
+    years_to_meno_init = first(years_to_meno_init),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pace_z  = z_pop(pace_index),
+    dt_z    = z_pop(years_to_meno_sub - years_to_meno_init),
+    PrePost = as.integer(meno.3group == "Pre-Post")
+  )
+
+lobule_meta_s3d <- lobule_meta_s3d %>%
+  left_join(woman_meta_s3d %>% select(Patient_ID, pace_z, dt_z, PrePost),
+            by = "Patient_ID")
+
+# ----------------------------------------------------------------------------
+# 6c. Boundary CD45⁺ cells (same definition: stromal, ≤20 µm from CK⁺)
+# ----------------------------------------------------------------------------
+boundary_cd45_s3d <- subsequent_nn_data %>%
+  filter(
+    `Phenotype CD45` == "CD45+",
+    `Tissue Category` == "Stroma",
+    as.numeric(`Distance to CK+`) <= 20
+  ) %>%
+  transmute(
+    Patient_ID, `Annotation ID`,
+    x = as.numeric(`Cell X Position`),
+    y = as.numeric(`Cell Y Position`)
+  )
+
+# ----------------------------------------------------------------------------
+# 6d. Helper: compute DBSCAN cluster fraction for one lobule
+# ----------------------------------------------------------------------------
+compute_cluster_frac <- function(df, eps, minPts) {
+  if (nrow(df) < minPts) return(tibble(n_total = nrow(df), cluster_frac = 0))
+  cl <- dbscan(as.matrix(df[, c("x", "y")]), eps = eps, minPts = minPts)$cluster
+  tibble(n_total = nrow(df), cluster_frac = sum(cl > 0) / nrow(df))
+}
+
+# ----------------------------------------------------------------------------
+# 6e. Helper: compute lobule-level cluster fractions for a given parameter set
+# ----------------------------------------------------------------------------
+compute_lobule_cluster <- function(eps, minPts) {
+  cluster_df <- boundary_cd45_s3d %>%
+    group_by(Patient_ID, `Annotation ID`) %>%
+    summarise(compute_cluster_frac(cur_data(), eps, minPts), .groups = "drop")
+  lobule_meta_s3d %>%
+    left_join(cluster_df, by = c("Patient_ID", "Annotation ID"))
+}
+
+# ----------------------------------------------------------------------------
+# 6f. Helper: fit interaction model and extract pace × trajectory p-value
+# ----------------------------------------------------------------------------
+fit_interaction <- function(df) {
+  df <- df %>% filter(!is.na(cluster_frac))
+  model   <- lm(cluster_frac ~ pace_z * PrePost + dt_z, data = df)
+  n_women <- n_distinct(df$Patient_ID)
+  vc      <- vcovCL(model, cluster = df$Patient_ID, type = "HC0")
+  ct      <- coeftest(model, vcov. = vc)
+  beta    <- ct["pace_z:PrePost", "Estimate"]
+  se      <- ct["pace_z:PrePost", "Std. Error"]
+  tval    <- beta / se
+  pval    <- 2 * pt(abs(tval), df = n_women - 1, lower.tail = FALSE)
+  tibble(interaction_coef = beta, interaction_p = pval,
+         n_lobules = nrow(df), n_women = n_women)
+}
+
+# ----------------------------------------------------------------------------
+# 6g. Sweep parameter grid
+# ----------------------------------------------------------------------------
+cat("  Running parameter grid...\n")
+
+param_results <- expand.grid(eps = eps_values, min_samples = minpts_values) %>%
+  as_tibble() %>%
+  rowwise() %>%
+  mutate(
+    lobule_df = list(compute_lobule_cluster(eps, min_samples)),
+    model_out = list(fit_interaction(lobule_df))
+  ) %>%
+  ungroup() %>%
+  unnest(model_out) %>%
+  select(eps, min_samples, interaction_coef, interaction_p, n_lobules, n_women)
+
+cat("  Grid results:\n")
+print(param_results)
+
+write_csv(param_results, file.path(OUT_DIR, "SuppS3D_dbscan_param_grid.csv"))
+
+# ----------------------------------------------------------------------------
+# 6h. Plot Supp Fig S3D: coefficient and p-value heatmaps
+# ----------------------------------------------------------------------------
+
+# Coefficient heatmap
+heatmap_coef <- ggplot(param_results,
+                       aes(factor(eps), factor(min_samples),
+                           fill = interaction_coef)) +
+  geom_tile(color = "white", linewidth = 1.5) +
+  geom_text(aes(label = sprintf("%.3f", interaction_coef)),
+            size = 5, fontface = "bold", color = text_color) +
+  scale_fill_gradient2(
+    low = "#00008B", mid = "white", high = "#8B0000", midpoint = 0,
+    name = "Interaction\nCoefficient"
+  ) +
+  labs(x = "eps (\u00B5m)", y = "minPts",
+       title = "Interaction Coefficient Across DBSCAN Parameters") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title     = element_text(face = "bold", size = 22, color = text_color,
+                                   hjust = 0.5, margin = margin(b = 15)),
+    axis.title     = element_text(face = "bold", size = 22, color = text_color),
+    axis.text      = element_text(size = 18, color = text_color, face = "bold"),
+    panel.grid     = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.title   = element_text(face = "bold", size = 18, color = text_color),
+    legend.text    = element_text(size = 14, color = text_color),
+    plot.margin    = margin(20, 20, 20, 20)
+  )
+
+# P-value heatmap
+heatmap_pval <- ggplot(param_results,
+                       aes(factor(eps), factor(min_samples),
+                           fill = interaction_p)) +
+  geom_tile(color = "white", linewidth = 1.5) +
+  geom_text(aes(label = sprintf("%.4f", interaction_p)),
+            size = 5, fontface = "bold", color = text_color) +
+  scale_fill_gradientn(
+    colors = c("#90EE90", "#FFFF00", "#006400"),
+    name   = "p-value"
+  ) +
+  labs(x = "eps (\u00B5m)", y = "minPts",
+       title = "Interaction p-values Across DBSCAN Parameters") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title     = element_text(face = "bold", size = 22, color = text_color,
+                                   hjust = 0.5, margin = margin(b = 15)),
+    axis.title     = element_text(face = "bold", size = 22, color = text_color),
+    axis.text      = element_text(size = 18, color = text_color, face = "bold"),
+    panel.grid     = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.title   = element_text(face = "bold", size = 11, color = text_color),
+    legend.text    = element_text(size = 14, color = text_color),
+    plot.margin    = margin(20, 20, 20, 20)
+  )
+
+# Combined layout
+fig_s3d <- heatmap_coef / heatmap_pval +
+  plot_annotation(
+    title    = "DBSCAN Parameter Stability Analysis",
+    subtitle = "Pace \u00D7 Trajectory interaction robustness across clustering parameters",
+    theme    = theme(
+      plot.title    = element_text(face = "bold", size = 18, hjust = 0.5,
+                                    color = text_color, margin = margin(b = 5)),
+      plot.subtitle = element_text(size = 13, hjust = 0.5,
+                                    color = text_color, margin = margin(b = 15))
+    )
+  )
+
+print(fig_s3d)
+
+
+# ============================================================================
+# 7.  SESSION COMPLETE
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  All Figure 3G/H and Supp S3B/C/D Complete\n")
+cat("========================================\n")
