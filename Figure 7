@@ -1,0 +1,557 @@
+# ============================================================================
+# Figure 7 — Data Preparation & Figures 7E–H
+# ============================================================================
+#
+# Description:
+#   Loads and prepares spatial nearest-neighbor (NN) and tissue density data
+#   from the immune-focused multiplex immunofluorescence cohort, along with
+#   the MBC NanoString clinical dataset. Then generates four figures
+#   characterizing M2 macrophage density, immune–senescence spatial
+#   coordination, and transcript-level macrophage polarization, all
+#   stratified by menopausal trajectory and involution pace.
+#
+# Figures produced:
+#   Fig 7E — Max stromal M2 (CD68⁺CD206⁺) density vs involution pace
+#   Fig 7F — Max M2 density in p16-low lobules vs involution pace
+#   Fig 7G — Immune–senescence targeting index vs involution pace
+#   Fig 7H — Mirror-balance transcript score vs involution pace
+#
+# Inputs (place in DATA_DIR):
+#   - immune_NN_data.txt                  Tab-delimited NN export (immune panel)
+#   - immune_cell_seg_summary.txt         Cell seg summary (immune panel)
+#   - pace_metrics_immune.xlsx            Clinical metadata (immune cohort)
+#   - MBC_clinical_data.xlsx              MBC NanoString clinical dataset
+#
+# Dependencies:
+#   dplyr, tidyr, stringr, readr, readxl, ggplot2, scales, FNN, purrr
+# ============================================================================
+
+
+# ============================================================================
+# 0.  SETUP — Load packages
+# ============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(readr)
+  library(readxl)
+  library(ggplot2)
+  library(scales)
+  library(FNN)
+  library(purrr)
+})
+
+
+# ============================================================================
+# 1.  FILE PATHS
+# ============================================================================
+
+DATA_DIR <- "data"
+OUT_DIR  <- "output"
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+immune_nn_path      <- file.path(DATA_DIR, "immune_NN_data.txt")
+immune_summary_path <- file.path(DATA_DIR, "immune_cell_seg_summary.txt")
+immune_pace_path    <- file.path(DATA_DIR, "pace_metrics_immune.xlsx")
+mbc_path            <- file.path(DATA_DIR, "MBC_clinical_data.xlsx")
+
+# Patients to exclude (QC failures)
+immune_exclude <- c("C31183", "C38385")
+
+
+# ============================================================================
+# 2.  HELPER FUNCTIONS
+# ============================================================================
+
+#' Extract patient ID from an Annotation ID string.
+#' Annotation IDs follow the pattern {P|S}_{PatientID}_{rest}.
+#' Applies corrections for two patients (P1, P2) whose imaging annotation
+#' IDs are abbreviated relative to their clinical record identifiers.
+extract_patient_id_immune <- function(annotation_ids) {
+  ids <- str_extract(annotation_ids, "(?<=^[PS]_)[A-Z0-9]+")
+  # NOTE: Update the two corrections below to match your imaging-to-clinical
+  # ID mapping. These are placeholders for two patients whose annotation
+  # prefixes were truncated during image export.
+  case_when(
+    ids == "CR93" ~ "CR5634",
+    ids == "MR97" ~ "MR10710",
+    TRUE          ~ ids
+  )
+}
+
+#' Build a tissue density lookup table from a cell_seg_summary data frame.
+#' Area is converted from square microns to mm².
+build_density_table <- function(seg_summary) {
+  seg_summary %>%
+    select(Annotation.ID, Slide.ID, Tissue.Category,
+           Tissue.Category.Area..square.microns.) %>%
+    distinct() %>%
+    transmute(
+      Annotation_ID   = Annotation.ID,
+      Slide_ID        = Slide.ID,
+      Tissue_Category = str_trim(Tissue.Category),
+      Tissue_Area_mm2 = Tissue.Category.Area..square.microns. / 1e6
+    ) %>%
+    arrange(Annotation_ID, Tissue_Category)
+}
+
+#' Population z-score (denominator uses N, not N-1).
+z_pop <- function(x) {
+  m <- mean(x, na.rm = TRUE)
+  s <- sqrt(mean((x - m)^2, na.rm = TRUE))
+  (x - m) / s
+}
+
+#' Recode menopausal trajectory factor to display labels.
+label_trajectory <- function(x) {
+  factor(x, levels = c("Pre-Post", "Post-Post"),
+         labels = c("Pre-Menopause", "Post-Menopause"))
+}
+
+#' Exact permutation test for the pace × trajectory interaction.
+#' Exhaustively permutes trajectory labels and computes the interaction
+#' coefficient (feature_z × PostPost) from OLS predicting pace.
+#' Returns a two-sided p-value.
+exact_perm_test <- function(df, feature_col) {
+  df <- df %>%
+    select(pace = pace_index, traj = meno.3group,
+           feature = all_of(feature_col)) %>%
+    drop_na() %>%
+    mutate(postpost = as.integer(traj == "Post-Post"),
+           z = z_pop(feature))
+
+  m_obs     <- lm(pace ~ z * postpost, data = df)
+  delta_obs <- coef(m_obs)[["z:postpost"]]
+
+  n <- nrow(df)
+  k <- sum(df$postpost == 1)
+  comb_mat <- combn(seq_len(n), k)
+  n_perm   <- ncol(comb_mat)
+
+  deltas <- numeric(n_perm)
+  for (j in seq_len(n_perm)) {
+    perm_post <- integer(n)
+    perm_post[comb_mat[, j]] <- 1
+    m_perm    <- lm(pace ~ z * perm_post, data = df)
+    deltas[j] <- coef(m_perm)["z:perm_post"]
+  }
+
+  list(delta_obs = unname(delta_obs),
+       p_int     = mean(abs(deltas) >= abs(delta_obs)),
+       n = n, k_postpost = k, n_perm = n_perm)
+}
+
+
+# ============================================================================
+# 3.  SHARED PLOT AESTHETICS & REUSABLE PLOTTING FUNCTION
+# ============================================================================
+
+text_color   <- "black"
+grid_color   <- "#E8E8E8"
+accent_color <- "#34495E"
+pre_color    <- "#1b9e77"
+post_color   <- "#d95f02"
+group_colors <- c("Pre-Menopause" = pre_color, "Post-Menopause" = post_color)
+
+#' Scatter plot of a per-woman feature (x) vs involution pace (y),
+#' colored by menopausal trajectory, with per-group regression lines.
+plot_pace_interaction <- function(df, x_col, xlab, title, subtitle, caption) {
+
+  x_range <- range(df[[x_col]], na.rm = TRUE)
+  x_seq   <- seq(x_range[1] - 0.5, x_range[2] + 0.5, length.out = 100)
+
+  pred_data <- df %>%
+    group_by(traj_label) %>%
+    do({
+      model <- lm(as.formula(paste("pace_index ~", x_col)), data = .)
+      newdf <- setNames(data.frame(x_seq), x_col)
+      data.frame(x = x_seq,
+                 pace_index = predict(model, newdata = newdf),
+                 traj_label = unique(.$traj_label))
+    }) %>%
+    ungroup()
+
+  ggplot() +
+    geom_line(data = pred_data,
+              aes(x = x, y = pace_index, color = traj_label),
+              linewidth = 1.8) +
+    geom_point(data = df,
+               aes(x = .data[[x_col]], y = pace_index, color = traj_label),
+               size = 3.5, alpha = 0.7) +
+    scale_color_manual(values = group_colors) +
+    scale_x_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+    labs(x = xlab, y = "Involution Pace",
+         color = "Menopausal\nTrajectory",
+         title = title, subtitle = subtitle, caption = caption) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 26, color = text_color,
+                                    hjust = 0.5, margin = margin(b = 8)),
+      plot.subtitle = element_text(size = 18, color = text_color, hjust = 0.5,
+                                    lineheight = 1.2, margin = margin(b = 15)),
+      plot.caption  = element_text(size = 14, color = text_color, hjust = 0,
+                                    face = "italic", lineheight = 1.2,
+                                    margin = margin(t = 10)),
+      axis.title.x  = element_text(face = "bold", size = 24, color = text_color,
+                                    margin = margin(t = 10), lineheight = 1.1),
+      axis.title.y  = element_text(face = "bold", size = 24, color = text_color,
+                                    margin = margin(r = 10)),
+      axis.text     = element_text(size = 18, color = text_color),
+      axis.line     = element_line(color = accent_color, linewidth = 0.6),
+      panel.border  = element_rect(color = accent_color, fill = NA, linewidth = 0.8),
+      panel.grid.major = element_line(color = grid_color, linewidth = 0.4),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white", color = NA),
+      legend.position  = "top",
+      legend.title     = element_text(face = "bold", size = 18, color = text_color,
+                                       lineheight = 1.1),
+      legend.text      = element_text(size = 16, color = text_color),
+      plot.margin      = margin(20, 20, 20, 20)
+    )
+}
+
+
+# ============================================================================
+# 4.  LOAD DATA — Immune Cohort NN Data
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Loading Immune Cohort NN Data\n")
+cat("========================================\n")
+
+# 4a. Read tab-delimited nearest-neighbor export from the immune panel
+immune_nn_data <- read.table(
+  immune_nn_path,
+  header = TRUE, sep = "\t", quote = "", check.names = FALSE,
+  fill = TRUE, comment.char = "", row.names = NULL
+)
+
+# 4b. Extract patient IDs and apply corrections
+immune_nn_data <- immune_nn_data %>%
+  mutate(Patient_ID = extract_patient_id_immune(`Annotation ID`))
+
+# 4c. Merge clinical pace metrics
+pace_metrics_immune <- read_excel(immune_pace_path)
+immune_nn_data <- immune_nn_data %>%
+  left_join(pace_metrics_immune, by = "Patient_ID")
+
+# 4d. Remove excluded patients
+immune_nn_data <- immune_nn_data %>%
+  filter(!Patient_ID %in% immune_exclude)
+
+stopifnot(!any(immune_nn_data$Patient_ID %in% immune_exclude))
+
+cat("  Unique patients:", n_distinct(immune_nn_data$Patient_ID), "\n")
+cat("  Total cells:", nrow(immune_nn_data), "\n")
+
+
+# ============================================================================
+# 5.  LOAD DATA — Immune Cohort Density Table
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Building Immune Cohort Density Table\n")
+cat("========================================\n")
+
+immune_seg_summary <- read.delim(immune_summary_path, stringsAsFactors = FALSE)
+immune_density <- build_density_table(immune_seg_summary)
+
+# Remove excluded patients by Annotation ID substring match
+immune_density <- immune_density %>%
+  filter(!str_detect(Annotation_ID, paste(immune_exclude, collapse = "|")))
+
+# Validate: each annotation should have exactly 3 tissue categories
+annot_counts <- immune_density %>%
+  group_by(Annotation_ID) %>%
+  summarise(n_cat = n(), .groups = "drop")
+
+if (all(annot_counts$n_cat == 3)) {
+  cat("  \u2713 All annotations have 3 tissue categories\n")
+} else {
+  cat("  \u26A0 Unexpected tissue category counts found\n")
+}
+
+
+# ============================================================================
+# 6.  LOAD DATA — MBC NanoString Clinical Dataset
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Loading MBC NanoString Clinical Data\n")
+cat("========================================\n")
+
+mbc_data <- read_excel(mbc_path)
+names(mbc_data) <- make.names(names(mbc_data), unique = TRUE)
+
+cat("  Rows:", nrow(mbc_data), "| Columns:", ncol(mbc_data), "\n")
+
+
+# ============================================================================
+# 7.  COMPUTE SHARED LOBULE-LEVEL DENSITIES (used by Figs 7E, 7F, 7G)
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Computing Lobule-Level Cell Densities\n")
+cat("========================================\n")
+
+# --- Stromal M2 macrophage (CD68⁺CD206⁺) counts per lobule ---
+stroma_m2 <- immune_nn_data %>%
+  filter(`Tissue Category` == "Stroma") %>%
+  group_by(Patient_ID, `Annotation ID`) %>%
+  summarise(
+    M2_count   = sum(`Phenotype CD68` == "CD68+" &
+                     `Phenotype CD206` == "CD206+", na.rm = TRUE),
+    CD68_count = sum(`Phenotype CD68` == "CD68+", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- Stromal tissue area ---
+stroma_area <- immune_density %>%
+  filter(Tissue_Category == "Stroma") %>%
+  select(Annotation_ID, stroma_area_mm2 = Tissue_Area_mm2)
+
+# --- Stromal density per lobule ---
+stroma_density <- stroma_m2 %>%
+  left_join(stroma_area, by = c("Annotation ID" = "Annotation_ID")) %>%
+  mutate(M2_stroma   = M2_count / stroma_area_mm2,
+         CD68_stroma = CD68_count / stroma_area_mm2) %>%
+  select(Patient_ID, `Annotation ID`, M2_stroma, CD68_stroma)
+
+# --- Epithelial p16⁺/CK⁺ senescent cell counts per lobule ---
+epi_p16 <- immune_nn_data %>%
+  filter(`Tissue Category` == "Epithelial") %>%
+  group_by(Patient_ID, `Annotation ID`) %>%
+  summarise(
+    p16_CK_count = sum(`Phenotype p16` == "p16+" &
+                       `Phenotype CK` == "CK+", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- Epithelial tissue area ---
+epi_area <- immune_density %>%
+  filter(Tissue_Category == "Epithelial") %>%
+  select(Annotation_ID, epi_area_mm2 = Tissue_Area_mm2)
+
+# --- Epithelial p16 density per lobule ---
+epi_density <- epi_p16 %>%
+  left_join(epi_area, by = c("Annotation ID" = "Annotation_ID")) %>%
+  mutate(p16_epi = p16_CK_count / epi_area_mm2) %>%
+  select(Patient_ID, `Annotation ID`, p16_epi)
+
+# --- Match stroma and epithelium per lobule ---
+lobule_densities <- inner_join(stroma_density, epi_density,
+                               by = c("Patient_ID", "Annotation ID"))
+
+cat("  Matched lobules:", nrow(lobule_densities), "\n")
+cat("  Unique patients:", n_distinct(lobule_densities$Patient_ID), "\n")
+
+# --- Patient-level pace and trajectory metadata ---
+pace_meta <- immune_nn_data %>%
+  select(Patient_ID, pace_index, meno.3group) %>%
+  distinct() %>%
+  filter(!is.na(pace_index), !is.na(meno.3group)) %>%
+  mutate(meno.3group = factor(meno.3group, levels = c("Pre-Post", "Post-Post")))
+
+# --- Define p16-low lobules (<80th percentile per woman) ---
+# Lobules with low senescent cell burden, used in Figs 7F and 7G to test
+# whether M2 behavior in non-senescent regions predicts involution pace.
+p16_thresholds <- lobule_densities %>%
+  group_by(Patient_ID) %>%
+  summarise(p16_80 = quantile(p16_epi, probs = 0.8, na.rm = TRUE),
+            .groups = "drop")
+
+lobule_p16low <- lobule_densities %>%
+  left_join(p16_thresholds, by = "Patient_ID") %>%
+  filter(p16_epi < p16_80)
+
+cat("  p16-low lobules:", nrow(lobule_p16low), "\n")
+
+
+# ============================================================================
+# 8.  FIGURE 7E — Maximum Stromal M2 Density vs Involution Pace
+# ============================================================================
+# Per-woman maximum stromal M2 density across all lobules. Captures the
+# "hotspot" M2 accumulation signal from the most active remodeling niche.
+
+cat("\n========================================\n")
+cat("  Figure 7E: Max Stromal M2 Density\n")
+cat("========================================\n")
+
+woman_7e <- lobule_densities %>%
+  group_by(Patient_ID) %>%
+  summarise(max_M2_stroma = max(M2_stroma, na.rm = TRUE),
+            n_lobules = n(), .groups = "drop") %>%
+  inner_join(pace_meta, by = "Patient_ID") %>%
+  mutate(z_max_M2   = z_pop(max_M2_stroma),
+         traj_label = label_trajectory(meno.3group))
+
+res_7e <- exact_perm_test(woman_7e, "max_M2_stroma")
+cat(sprintf("  Interaction p = %s (n = %d, %d permutations)\n",
+            signif(res_7e$p_int, 3), res_7e$n, res_7e$n_perm))
+
+fig7e <- plot_pace_interaction(
+  woman_7e, x_col = "z_max_M2",
+  xlab     = "Max Stromal M2 Density\n(z-scored CD68\u207ACD206\u207A cells/mm\u00B2)",
+  title    = "Maximum Stromal M2 Density",
+  subtitle = sprintf("Exact permutation p = %.4f", res_7e$p_int),
+  caption  = sprintf("n = %d women | Each point = one woman's max M2 density across lobules",
+                     res_7e$n)
+)
+
+print(fig7e)
+
+
+# ============================================================================
+# 9.  FIGURE 7F — Max M2 Density in p16-Low Lobules
+# ============================================================================
+# Restricts the M2 hotspot analysis to lobules in the bottom 80% of
+# epithelial p16⁺ density per woman. Tests whether M2 macrophages
+# accumulate in non-senescent regions in a pace-dependent manner.
+
+cat("\n========================================\n")
+cat("  Figure 7F: Max M2 in p16-Low Lobules\n")
+cat("========================================\n")
+
+woman_7f <- lobule_p16low %>%
+  group_by(Patient_ID) %>%
+  summarise(max_M2_p16low    = max(M2_stroma, na.rm = TRUE),
+            n_p16low_lobules = n(), .groups = "drop") %>%
+  inner_join(pace_meta, by = "Patient_ID") %>%
+  mutate(z_max_M2_p16low = z_pop(max_M2_p16low),
+         traj_label      = label_trajectory(meno.3group))
+
+res_7f <- exact_perm_test(woman_7f, "max_M2_p16low")
+cat(sprintf("  Interaction p = %s (n = %d)\n", signif(res_7f$p_int, 3), res_7f$n))
+
+fig7f <- plot_pace_interaction(
+  woman_7f, x_col = "z_max_M2_p16low",
+  xlab     = "Max M2 Density in p16-Low Lobules\n(z-scored)",
+  title    = "Maximum M2 Density in p16-Low Lobules",
+  subtitle = sprintf("Exact permutation p = %.4f", res_7f$p_int),
+  caption  = sprintf("n = %d women | p16-low = bottom 80%% of epithelial p16\u207A density per woman",
+                     res_7f$n)
+)
+
+print(fig7f)
+
+
+# ============================================================================
+# 10. FIGURE 7G — Immune–Senescence Targeting Index
+# ============================================================================
+# Per-woman Pearson correlation between stromal M2 density and epithelial
+# p16⁺ density across p16-low lobules. A positive value means M2 macrophages
+# preferentially accumulate near nascent senescent cells even in regions
+# with low overall senescence burden.
+
+cat("\n========================================\n")
+cat("  Figure 7G: Targeting Index\n")
+cat("========================================\n")
+
+woman_7g <- lobule_p16low %>%
+  group_by(Patient_ID) %>%
+  summarise(
+    targeting_index  = cor(M2_stroma, p16_epi, use = "complete.obs"),
+    n_p16low_lobules = n(),
+    .groups = "drop"
+  ) %>%
+  inner_join(pace_meta, by = "Patient_ID") %>%
+  mutate(z_targeting = z_pop(targeting_index),
+         traj_label  = label_trajectory(meno.3group))
+
+res_7g <- exact_perm_test(woman_7g, "z_targeting")
+cat(sprintf("  Interaction p = %s (n = %d)\n", signif(res_7g$p_int, 3), res_7g$n))
+
+# Per-trajectory slope p-values for caption annotation
+p_pre  <- summary(lm(pace_index ~ z_targeting,
+                     data = filter(woman_7g, meno.3group == "Pre-Post")))$coefficients["z_targeting", "Pr(>|t|)"]
+p_post <- summary(lm(pace_index ~ z_targeting,
+                     data = filter(woman_7g, meno.3group == "Post-Post")))$coefficients["z_targeting", "Pr(>|t|)"]
+
+fig7g <- plot_pace_interaction(
+  woman_7g, x_col = "targeting_index",
+  xlab     = "Immune\u2013Senescence Targeting Index",
+  title    = "Stromal M2\u2013Epithelial p16 Coordination",
+  subtitle = sprintf("Exact permutation p = %s", signif(res_7g$p_int, 3)),
+  caption  = sprintf("Pre-Menopause slope p = %s | Post-Menopause slope p = %s",
+                     signif(p_pre, 3), signif(p_post, 3))
+)
+
+print(fig7g)
+
+
+# ============================================================================
+# 11. FIGURE 7H — Mirror-Balance Transcript Score
+# ============================================================================
+# Composite NanoString score reflecting the balance between pro-inflammatory
+# and anti-inflammatory macrophage transcripts:
+#   score = mean(z-scored pro-inflammatory) − mean(z-scored anti-inflammatory)
+#
+# Pro-inflammatory:  IL6, STAT3, FCGR3A/B
+# Anti-inflammatory: MSR1, MRC1, CD163, CSF1R, ITGAM, CD68
+
+cat("\n========================================\n")
+cat("  Figure 7H: Mirror-Balance Transcript\n")
+cat("========================================\n")
+
+pro_inflammatory  <- c("IL6", "STAT3", "FCGR3A/B")
+anti_inflammatory <- c("MSR1", "MRC1", "CD163", "CSF1R", "ITGAM", "CD68")
+all_genes         <- c(pro_inflammatory, anti_inflammatory)
+
+# Link NanoString gene expression to pace metadata
+# (init.block2 in MBC data matches Patient_ID in the immune cohort)
+woman_7h <- mbc_data %>%
+  select(Patient_ID = init.block2, all_of(all_genes)) %>%
+  inner_join(pace_meta, by = "Patient_ID") %>%
+  # Z-score each gene across women
+  mutate(across(all_of(all_genes), ~ z_pop(as.numeric(as.character(.))))) %>%
+  # Compute mirror-balance score per woman
+  rowwise() %>%
+  mutate(
+    mirror_score = mean(c_across(all_of(pro_inflammatory)),  na.rm = TRUE) -
+                   mean(c_across(all_of(anti_inflammatory)), na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(z_mirror   = z_pop(mirror_score),
+         traj_label = label_trajectory(meno.3group))
+
+res_7h <- exact_perm_test(woman_7h, "mirror_score")
+cat(sprintf("  Interaction p = %s (n = %d)\n", signif(res_7h$p_int, 3), res_7h$n))
+
+# Per-trajectory slopes for subtitle
+slopes_7h <- woman_7h %>%
+  group_by(meno.3group) %>%
+  summarise(slope = coef(lm(pace_index ~ z_mirror))[2], .groups = "drop")
+
+fig7h <- plot_pace_interaction(
+  woman_7h, x_col = "z_mirror",
+  xlab     = "Mirror-Balance Transcript Score\n(z-scored)",
+  title    = "Mirror-Balance Transcript Score",
+  subtitle = sprintf(
+    "Exact permutation p = %.4f | Slopes: Pre = %.3f, Post = %.3f",
+    res_7h$p_int,
+    slopes_7h$slope[slopes_7h$meno.3group == "Pre-Post"],
+    slopes_7h$slope[slopes_7h$meno.3group == "Post-Post"]
+  ),
+  caption  = paste0(
+    "n = ", res_7h$n, " women\n",
+    "Pro-inflammatory: IL6, STAT3, FCGR3A/B\n",
+    "Anti-inflammatory: MSR1, MRC1, CD163, CSF1R, ITGAM, CD68"
+  )
+)
+
+print(fig7h)
+
+
+# ============================================================================
+# 12. SESSION COMPLETE
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Figure 7 Complete\n")
+cat("========================================\n")
+cat("  Data frames: immune_nn_data, immune_density, mbc_data\n")
+cat("  Figures: 7E, 7F, 7G, 7H\n")
