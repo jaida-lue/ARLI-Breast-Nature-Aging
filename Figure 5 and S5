@@ -1,0 +1,1238 @@
+# ============================================================================
+# Figure 5 — Data Preparation & Figures 5A–E
+# Epithelial Marker Abundance, Hub Patchiness, and Proliferative Niche
+# ============================================================================
+#
+# Description:
+#   Loads and prepares spatial nearest-neighbor (NN) data from the
+#   senescence/proliferation multiplex panel, then generates five figures
+#   characterizing epithelial marker expression patterns and their
+#   relationship to involution pace and menopausal trajectory.
+#
+# Figures produced:
+#   Fig 5A — Forest plot: Pearson correlation (with bootstrap 95% CI)
+#            between per-woman mean epithelial marker fractions and
+#            involution pace for five markers.
+#   Fig 5B — Scatter plot: EREG⁺/pSTAT3⁺ between-lobule variance
+#            ("hub patchiness") vs involution pace.
+#   Fig 5C — Logistic regression: probability that a lobule is an
+#            EREG-proximal proliferative niche, by pace × menopausal
+#            trajectory (Pre→Post vs Post→Post).
+#   Fig 5D — Logistic regression: probability that a lobule is a
+#            pSTAT3-proximal proliferative niche, by pace × trajectory.
+#   Fig 5E — Logistic regression: probability of EREG-proximal
+#            proliferative niche, by pace × continuous menopause
+#            proximity (years to menopause, z-scored at ±1 SD).
+#
+# Inputs (place in DATA_DIR):
+#   - senescence_prolif_NN_data.txt       Tab-delimited NN export
+#   - pace_metrics_senescence_prolif.xlsx  Clinical metadata
+#
+# Dependencies:
+#   dplyr, tidyr, stringr, readr, readxl, ggplot2, scales, purrr,
+#   FNN, sandwich, lmtest, ggeffects
+# ============================================================================
+
+
+# ============================================================================
+# 0.  SETUP — Load packages
+# ============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(readr)
+  library(readxl)
+  library(ggplot2)
+  library(scales)
+  library(purrr)
+  library(FNN)
+  library(sandwich)
+  library(lmtest)
+  library(ggeffects)
+})
+
+set.seed(123)
+
+
+# ============================================================================
+# 1.  FILE PATHS & CONSTANTS
+# ============================================================================
+
+DATA_DIR <- "data"
+OUT_DIR  <- "output"
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+nn_path   <- file.path(DATA_DIR, "senescence_prolif_NN_data.txt")
+pace_path <- file.path(DATA_DIR, "pace_metrics_senescence_prolif.xlsx")
+
+# Patients to exclude (QC failures)
+patients_exclude <- c("P1", "P2")
+
+
+# ============================================================================
+# 2.  HELPER FUNCTIONS
+# ============================================================================
+
+#' Extract patient ID from an Annotation ID string.
+#' Applies corrections for two patients whose imaging annotation prefixes
+#' are abbreviated relative to their clinical record identifiers.
+extract_patient_id <- function(annotation_ids) {
+  ids <- str_extract(annotation_ids, "(?<=^[PS]_)[A-Z0-9]+")
+}
+
+#' Population z-score (denominator uses N, not N-1).
+z_pop <- function(x) {
+  m <- mean(x, na.rm = TRUE)
+  s <- sqrt(mean((x - m)^2, na.rm = TRUE))
+  (x - m) / s
+}
+
+#' Recode menopausal trajectory factor to display labels.
+label_trajectory <- function(x) {
+  factor(x, levels = c("Pre-Post", "Post-Post"),
+         labels = c("Pre-Menopause", "Post-Menopause"))
+}
+
+
+# ============================================================================
+# 3.  SHARED PLOT AESTHETICS
+# ============================================================================
+
+text_color   <- "black"
+grid_color   <- "#E8E8E8"
+accent_color <- "#34495E"
+pre_color    <- "#3498DB"
+post_color   <- "#E74C3C"
+group_colors <- c("Pre-Menopause" = pre_color, "Post-Menopause" = post_color)
+
+# Reusable theme for logistic regression plots (Figs 5C, 5D, 5E)
+theme_logistic <- theme_minimal(base_size = 13) +
+  theme(
+    axis.title.x  = element_text(face = "bold", size = 32, color = text_color,
+                                  margin = margin(t = 15)),
+    axis.title.y  = element_text(face = "bold", size = 32, color = text_color,
+                                  margin = margin(r = 15), lineheight = 1.1),
+    axis.text     = element_text(size = 28, color = text_color),
+    axis.line     = element_line(color = accent_color, linewidth = 0.6),
+    panel.border  = element_rect(color = accent_color, fill = NA, linewidth = 0.8),
+    panel.grid.major = element_line(color = grid_color, linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.position    = "top",
+    legend.direction   = "horizontal",
+    legend.justification = "center",
+    legend.text        = element_text(size = 28, color = text_color),
+    legend.key.size    = unit(1.5, "cm"),
+    legend.spacing.x   = unit(0.5, "cm"),
+    legend.margin      = margin(b = 10),
+    plot.margin        = margin(10, 10, 10, 10)
+  )
+
+
+# ============================================================================
+# 4.  LOAD & PREPARE DATA
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Loading Senescence/Proliferation Panel\n")
+cat("========================================\n")
+
+# 4a. Read tab-delimited NN export
+nn_data <- read.table(
+  nn_path,
+  header = TRUE, sep = "\t", quote = "", check.names = FALSE,
+  fill = TRUE, comment.char = "", row.names = NULL
+)
+
+# 4b. Extract patient IDs and apply corrections
+nn_data <- nn_data %>%
+  mutate(Patient_ID = extract_patient_id(`Annotation ID`))
+
+# 4c. Merge clinical pace metrics
+pace_metrics <- read_excel(pace_path)
+nn_data <- nn_data %>%
+  left_join(pace_metrics, by = "Patient_ID")
+
+# 4d. Remove excluded patients
+nn_data <- nn_data %>%
+  filter(!Patient_ID %in% patients_exclude)
+
+stopifnot(!any(nn_data$Patient_ID %in% patients_exclude))
+
+cat("  Unique patients:", n_distinct(nn_data$Patient_ID), "\n")
+cat("  Total cells:", nrow(nn_data), "\n")
+
+# 4e. Ensure numeric distance column (used in Figs 5C, 5E)
+nn_data <- nn_data %>%
+  mutate(`Distance to EREG+` = as.numeric(`Distance to EREG+`))
+
+# 4f. Pre-filter epithelial cells (used across multiple figures)
+epi_cells <- nn_data %>%
+  filter(`Tissue Category` == "Epithelial")
+
+cat("  Epithelial cells:", nrow(epi_cells), "\n")
+
+
+# ============================================================================
+# 5.  FIGURE 5A — Epithelial Marker Abundance vs Involution Pace
+# ============================================================================
+# For each of five epithelial markers, computes the per-woman mean fraction
+# of positive cells, then calculates the Pearson correlation with involution
+# pace. Bootstrap 95% CIs are generated from 1,000 resamples. Displayed as
+# a horizontal forest plot.
+
+cat("\n========================================\n")
+cat("  Figure 5A: Marker Abundance\n")
+cat("========================================\n")
+
+# --- Per-lobule epithelial marker fractions ---
+lobule_fractions <- epi_cells %>%
+  group_by(`Annotation ID`, Patient_ID) %>%
+  summarise(
+    frac_pSTAT3 = mean(`Phenotype pSTAT3` == "pSTAT3+"),
+    frac_CD16   = mean(`Phenotype CD16`   == "CD16+"),
+    frac_p16    = mean(`Phenotype p16`    == "p16+"),
+    frac_Ki67   = mean(`Phenotype Ki67`   == "Ki67+"),
+    frac_EREG   = mean(`Phenotype EREG`   == "EREG+"),
+    .groups = "drop"
+  )
+
+# --- Per-woman means ---
+woman_means <- lobule_fractions %>%
+  group_by(Patient_ID) %>%
+  summarise(
+    mean_pSTAT3 = mean(frac_pSTAT3, na.rm = TRUE),
+    mean_CD16   = mean(frac_CD16,   na.rm = TRUE),
+    mean_p16    = mean(frac_p16,    na.rm = TRUE),
+    mean_Ki67   = mean(frac_Ki67,   na.rm = TRUE),
+    mean_EREG   = mean(frac_EREG,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    nn_data %>% select(Patient_ID, pace_index) %>% distinct(),
+    by = "Patient_ID"
+  )
+
+# --- Pearson r with bootstrap 95% CI per marker ---
+markers <- c("pSTAT3", "CD16", "p16", "Ki67", "EREG")
+
+cor_results <- map_dfr(markers, function(marker) {
+  varname <- paste0("mean_", marker)
+  r_obs   <- cor(woman_means[[varname]], woman_means$pace_index, method = "pearson")
+
+  # 1,000 bootstrap resamples for confidence interval
+  boot_r <- replicate(1000, {
+    idx <- sample(nrow(woman_means), replace = TRUE)
+    cor(woman_means[[varname]][idx], woman_means$pace_index[idx], method = "pearson")
+  })
+  ci <- quantile(boot_r, probs = c(0.025, 0.975), na.rm = TRUE)
+
+  tibble(marker = marker, r = r_obs, ci_low = ci[1], ci_high = ci[2])
+}) %>%
+  mutate(marker = factor(marker,
+                         levels = c("EREG", "Ki67", "p16", "pSTAT3", "CD16")))
+
+# --- Plot ---
+fig5a <- ggplot(cor_results, aes(x = r, y = marker)) +
+  geom_vline(xintercept = 0, linetype = "dotted", linewidth = 0.95, color = "red") +
+  geom_point(size = 5, color = "darkblue") +
+  geom_errorbarh(
+    aes(xmin = ci_low, xmax = ci_high),
+    height = 0.2, color = "darkblue", linewidth = 1.3
+  ) +
+  labs(
+    x = "Pearson correlation with involution pace (r)",
+    y = "Mean Epithelial Fraction"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title.x = element_text(size = 32, face = "bold"),
+    axis.title.y = element_text(size = 32, face = "bold"),
+    axis.text.x  = element_text(size = 28),
+    axis.text.y  = element_text(size = 28)
+  )
+
+print(fig5a)
+
+
+# ============================================================================
+# 6.  FIGURE 5B — Hub Patchiness (EREG⁺/pSTAT3⁺ Variance) vs Pace
+# ============================================================================
+# "Hub patchiness" captures the between-lobule variability in EREG⁺ and
+# pSTAT3⁺ epithelial fractions within each woman. High patchiness means
+# some lobules are marker-rich "hubs" while others are depleted. The
+# composite score is the mean of the z-scored variances for EREG and pSTAT3.
+
+cat("\n========================================\n")
+cat("  Figure 5B: Hub Patchiness\n")
+cat("========================================\n")
+
+# --- Between-lobule variance per woman ---
+woman_variance <- lobule_fractions %>%
+  group_by(Patient_ID) %>%
+  summarise(
+    var_EREG   = var(frac_EREG,   na.rm = TRUE),
+    var_pSTAT3 = var(frac_pSTAT3, na.rm = TRUE),
+    n_lobules  = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n_lobules >= 2) %>%
+  # Z-score each variance component, then average into composite
+  mutate(
+    var_EREG_z   = as.numeric(scale(var_EREG)),
+    var_pSTAT3_z = as.numeric(scale(var_pSTAT3)),
+    HubPatchiness = rowMeans(cbind(var_EREG_z, var_pSTAT3_z), na.rm = TRUE)
+  ) %>%
+  left_join(
+    nn_data %>% select(Patient_ID, pace_index) %>% distinct(),
+    by = "Patient_ID"
+  ) %>%
+  filter(!is.na(pace_index))
+
+# --- Correlation test ---
+cor_5b  <- cor.test(woman_variance$pace_index, woman_variance$HubPatchiness,
+                    method = "pearson")
+r_val   <- round(cor_5b$estimate, 2)
+p_val   <- signif(cor_5b$p.value, 2)
+n_women <- nrow(woman_variance)
+
+# --- Plot ---
+fig5b <- ggplot(woman_variance, aes(x = pace_index, y = HubPatchiness)) +
+  geom_point(size = 8, color = "darkblue") +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 2, color = "darkblue") +
+  annotate(
+    "label", x = Inf, y = Inf, hjust = 1.05, vjust = 1.05,
+    label = paste0("r = ", r_val, "\np = ", p_val, "\nn = ", n_women),
+    size = 10, fontface = "bold", label.size = 0.8,
+    label.padding = unit(0.4, "lines"),
+    fill = "white", color = "black"
+  ) +
+  labs(
+    x = "Involution Pace",
+    y = "EREG\u207A and pSTAT3\u207A Variance"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.title.x = element_text(size = 32, face = "bold"),
+    axis.title.y = element_text(size = 32, face = "bold"),
+    axis.text.x  = element_text(size = 28),
+    axis.text.y  = element_text(size = 28)
+  )
+
+print(fig5b)
+
+
+# ============================================================================
+# 7.  FIGURE 5C — EREG-Proximal Proliferative Niche × Trajectory
+# ============================================================================
+# Identifies lobules where Ki67⁺/EREG⁻ proliferating cells are spatially
+# close to EREG⁺ signaling cells (bottom 20% of median distance = "hot"
+# lobules). A logistic regression with woman-clustered SEs tests whether
+# the probability of being a hot lobule depends on pace × trajectory.
+
+cat("\n========================================\n")
+cat("  Figure 5C: EREG Proximity × Trajectory\n")
+cat("========================================\n")
+
+# --- Median distance from Ki67⁺/EREG⁻ cells to nearest EREG⁺ cell ---
+ereg_lobule_medians <- epi_cells %>%
+  filter(`Phenotype Ki67` == "Ki67+", `Phenotype EREG` == "EREG-") %>%
+  group_by(`Annotation ID`, Patient_ID, meno.3group, pace_index) %>%
+  summarise(
+    median_dist_to_EREG = median(`Distance to EREG+`, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- Define hot lobules (bottom 20% of median distance) ---
+ereg_cutoff <- quantile(ereg_lobule_medians$median_dist_to_EREG, 0.2, na.rm = TRUE)
+
+ereg_lobule_medians <- ereg_lobule_medians %>%
+  mutate(
+    hot     = as.integer(median_dist_to_EREG <= ereg_cutoff),
+    pace_z  = as.numeric(scale(pace_index)),
+    meno.3group = factor(meno.3group, levels = c("Pre-Post", "Post-Post"))
+  )
+
+# --- Logistic regression with woman-clustered robust SEs ---
+fit_5c     <- glm(hot ~ pace_z * meno.3group, family = binomial(),
+                  data = ereg_lobule_medians)
+vcov_5c    <- vcovCL(fit_5c, cluster = ereg_lobule_medians$Patient_ID)
+ct_5c      <- coeftest(fit_5c, vcov = vcov_5c)
+b_int_5c   <- ct_5c["pace_z:meno.3groupPost-Post", "Estimate"]
+p_int_5c   <- ct_5c["pace_z:meno.3groupPost-Post", "Pr(>|z|)"]
+
+cat(sprintf("  Interaction \u03B2 = %.3f, p = %s\n", b_int_5c, signif(p_int_5c, 3)))
+
+# --- Predicted probabilities ---
+pred_5c <- ggpredict(fit_5c, terms = c("pace_z", "meno.3group"))
+pred_5c$group <- label_trajectory(pred_5c$group)
+
+# --- Plot ---
+fig5c <- ggplot(pred_5c, aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.25, color = NA) +
+  geom_line(linewidth = 1.8, alpha = 0.9) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.5, size = 8,
+           fontface = "bold", color = text_color,
+           label = paste0("Interaction \u03B2 = ", round(b_int_5c, 3),
+                          "\np = ", signif(p_int_5c, 3))) +
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values  = group_colors) +
+  scale_x_continuous(breaks = pretty_breaks(n = 8), expand = expansion(mult = 0.02)) +
+  scale_y_continuous(breaks = pretty_breaks(n = 8), limits = c(0, 0.7),
+                     labels = percent_format(accuracy = 1),
+                     expand = expansion(mult = 0.02)) +
+  labs(x = "Involution Pace (z-score)",
+       y = "Probability of Proliferation\nNear EREG\u207A Cells",
+       color = NULL, fill = NULL) +
+  theme_logistic
+
+print(fig5c)
+
+
+# ============================================================================
+# 8.  FIGURE 5D — pSTAT3-Proximal Proliferative Niche × Trajectory
+# ============================================================================
+# Same logic as Fig 5C but for Ki67⁺/pSTAT3⁻ cells near pSTAT3⁺ cells.
+# Uses FNN::get.knnx to compute nearest-neighbor distances since the
+# pSTAT3 distance column is not pre-computed in the NN export.
+
+cat("\n========================================\n")
+cat("  Figure 5D: pSTAT3 Proximity × Trajectory\n")
+cat("========================================\n")
+
+# --- Define sources (Ki67⁺/pSTAT3⁻) and targets (pSTAT3⁺) ---
+sources_5d <- epi_cells %>%
+  filter(`Phenotype Ki67` == "Ki67+", `Phenotype pSTAT3` == "pSTAT3-")
+
+targets_5d <- epi_cells %>%
+  filter(`Phenotype pSTAT3` == "pSTAT3+")
+
+# --- Compute nearest-neighbor distance per source cell ---
+sources_split <- split(sources_5d, sources_5d$`Annotation ID`)
+targets_split <- split(targets_5d, targets_5d$`Annotation ID`)
+
+nearest_dist_5d <- map_dfr(names(sources_split), function(lob_id) {
+  src <- sources_split[[lob_id]]
+  tgt <- targets_split[[lob_id]]
+
+  if (is.null(tgt) || nrow(tgt) == 0) {
+    return(tibble(`Annotation ID` = lob_id, Patient_ID = unique(src$Patient_ID),
+                  pace_index = unique(src$pace_index),
+                  meno.3group = unique(src$meno.3group),
+                  dist_to_target = NA_real_))
+  }
+
+  nn <- get.knnx(
+    data  = tgt %>% select(`Cell X Position`, `Cell Y Position`) %>% as.matrix(),
+    query = src %>% select(`Cell X Position`, `Cell Y Position`) %>% as.matrix(),
+    k = 1
+  )
+
+  tibble(`Annotation ID` = lob_id, Patient_ID = src$Patient_ID,
+         pace_index = src$pace_index, meno.3group = src$meno.3group,
+         dist_to_target = nn$nn.dist[, 1])
+})
+
+# --- Lobule-level median distance ---
+pstat3_lobule_medians <- nearest_dist_5d %>%
+  group_by(`Annotation ID`, Patient_ID, meno.3group, pace_index) %>%
+  summarise(
+    median_dist_pSTAT3 = median(dist_to_target, na.rm = TRUE),
+    n_sources          = sum(!is.na(dist_to_target)),
+    .groups = "drop"
+  ) %>%
+  filter(n_sources > 0)
+
+# --- Define hot lobules (bottom 20%) ---
+pstat3_cutoff <- quantile(pstat3_lobule_medians$median_dist_pSTAT3, 0.2, na.rm = TRUE)
+
+pstat3_lobule_medians <- pstat3_lobule_medians %>%
+  mutate(
+    hot     = as.integer(median_dist_pSTAT3 <= pstat3_cutoff),
+    pace_z  = as.numeric(scale(pace_index)),
+    meno.3group = factor(meno.3group, levels = c("Pre-Post", "Post-Post"))
+  )
+
+# --- Logistic regression with woman-clustered robust SEs ---
+fit_5d     <- glm(hot ~ pace_z * meno.3group, family = binomial(),
+                  data = pstat3_lobule_medians)
+vcov_5d    <- vcovCL(fit_5d, cluster = pstat3_lobule_medians$Patient_ID)
+ct_5d      <- coeftest(fit_5d, vcov = vcov_5d)
+b_int_5d   <- ct_5d["pace_z:meno.3groupPost-Post", "Estimate"]
+p_int_5d   <- ct_5d["pace_z:meno.3groupPost-Post", "Pr(>|z|)"]
+
+cat(sprintf("  Interaction \u03B2 = %.3f, p = %s\n", b_int_5d, signif(p_int_5d, 3)))
+
+# --- Predicted probabilities ---
+pred_5d <- ggpredict(fit_5d, terms = c("pace_z", "meno.3group"))
+pred_5d$group <- label_trajectory(pred_5d$group)
+
+# --- Plot ---
+fig5d <- ggplot(pred_5d, aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.25, color = NA) +
+  geom_line(linewidth = 1.8, alpha = 0.9) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.5, size = 8,
+           fontface = "bold", color = text_color,
+           label = paste0("Interaction \u03B2 = ", round(b_int_5d, 3),
+                          "\np = ", signif(p_int_5d, 3))) +
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values  = group_colors) +
+  scale_x_continuous(breaks = pretty_breaks(n = 8), expand = expansion(mult = 0.02)) +
+  scale_y_continuous(breaks = pretty_breaks(n = 8), limits = c(0, 0.8),
+                     labels = percent_format(accuracy = 1),
+                     expand = expansion(mult = 0.02)) +
+  labs(x = "Involution Pace (z-score)",
+       y = "Probability of Proliferation\nNear pSTAT3\u207A Cells",
+       color = NULL, fill = NULL) +
+  theme_logistic
+
+print(fig5d)
+
+
+# ============================================================================
+# 9.  FIGURE 5E — EREG Proximity × Continuous Menopause Proximity
+# ============================================================================
+# Instead of the binary Pre→Post / Post→Post split, this models the
+# interaction between involution pace and continuous years-to-menopause.
+# Predictions are shown at -1 SD (post-menopausal), mean, and +1 SD
+# (pre-menopausal) of menopause proximity.
+
+cat("\n========================================\n")
+cat("  Figure 5E: EREG × Continuous Menopause\n")
+cat("========================================\n")
+
+# --- Build lobule-level data with continuous menopause proximity ---
+lobule_5e <- ereg_lobule_medians %>%
+  left_join(
+    nn_data %>% select(`Annotation ID`, years_to_meno_init) %>%
+      distinct(`Annotation ID`, .keep_all = TRUE),
+    by = "Annotation ID"
+  ) %>%
+  filter(!is.na(pace_index), !is.na(years_to_meno_init)) %>%
+  mutate(
+    proximity_z = as.numeric(scale(years_to_meno_init))
+  )
+
+# --- Logistic regression: pace × continuous menopause proximity ---
+fit_5e     <- glm(hot ~ pace_z * proximity_z, family = binomial(),
+                  data = lobule_5e)
+vcov_5e    <- vcovCL(fit_5e, cluster = lobule_5e$Patient_ID)
+ct_5e      <- coeftest(fit_5e, vcov = vcov_5e)
+b_int_5e   <- ct_5e["pace_z:proximity_z", "Estimate"]
+p_int_5e   <- ct_5e["pace_z:proximity_z", "Pr(>|z|)"]
+
+cat(sprintf("  Interaction \u03B2 = %.3f, p = %s\n", b_int_5e, signif(p_int_5e, 3)))
+
+# --- Predicted probabilities at menopause proximity = -1 SD, 0, +1 SD ---
+pred_5e <- ggpredict(fit_5e, terms = c("pace_z", "proximity_z [-1,0,1]"))
+
+pred_5e$group <- factor(
+  pred_5e$group,
+  levels = c("-1", "0", "1"),
+  labels = c("Post-menopause (\u22121 SD)",
+             "Average proximity to menopause",
+             "Pre-menopause (+1 SD)")
+)
+
+proximity_colors <- c(
+  "Post-menopause (\u22121 SD)"         = "#3498DB",
+  "Average proximity to menopause" = "#9B59B6",
+  "Pre-menopause (+1 SD)"          = "#E74C3C"
+)
+
+# --- Plot ---
+fig5e <- ggplot(pred_5e, aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.25, color = NA) +
+  geom_line(linewidth = 1.8, alpha = 0.9) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.5, size = 8,
+           fontface = "bold", color = text_color,
+           label = paste0("Interaction \u03B2 = ", round(b_int_5e, 3),
+                          "\np = ", signif(p_int_5e, 3))) +
+  scale_color_manual(values = proximity_colors) +
+  scale_fill_manual(values  = proximity_colors) +
+  scale_x_continuous(breaks = pretty_breaks(n = 8), expand = expansion(mult = 0.02)) +
+  scale_y_continuous(breaks = pretty_breaks(n = 8), limits = c(0, 1),
+                     labels = percent_format(accuracy = 1),
+                     expand = expansion(mult = 0.02)) +
+  labs(x = "Involution Pace (z-score)",
+       y = "Probability of Proliferation\nNear EREG\u207A Cells",
+       color = NULL, fill = NULL) +
+  theme_logistic +
+  theme(
+    legend.text = element_text(size = 24),
+    legend.key.size = unit(1.2, "cm"),
+    legend.spacing.x = unit(0.2, "cm")
+  ) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE),
+         fill  = guide_legend(nrow = 2, byrow = TRUE))
+
+print(fig5e)
+
+
+# ============================================================================
+# 10. SESSION COMPLETE
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Figure 5 Complete\n")
+cat("========================================\n")
+cat("  Data: nn_data (senescence/proliferation panel)\n")
+cat("  Figures: 5A, 5B, 5C, 5D, 5E\n")
+
+# ============================================================================
+# Supplementary Figure S5 — Figures S5A–J
+# Epithelial Heterogeneity, Cell-Level Adjacency, and Hot Lobule Analyses
+# ============================================================================
+#
+# Description:
+#   Supplementary analyses supporting Figure 5. Uses the same
+#   senescence/proliferation NN data loaded in Figure5_complete.R.
+#
+# Figures produced:
+#   S5A  — EREG-driven heterogeneity (between-lobule variance) vs pace
+#   S5B  — pSTAT3-driven heterogeneity vs pace
+#   S5C  — pSTAT3 vs EREG heterogeneity cross-correlation
+#   S5D  — Ki67⁺EREG⁻ → p16⁺ cell-level median distance vs pace,
+#          OLS with HC3 SEs, by menopausal trajectory
+#   S5E  — Ki67⁺EREG⁻ → p16⁺ cell-level adjacency (CF10) vs pace
+#   S5F  — Ki67⁺EREG⁺ → p16⁺ cell-level adjacency (CF10) vs pace
+#   S5G  — Hot p16-embedded proliferation in Ki67-rich lobules
+#   S5H  — Hot CD16 engagement in Ki67-rich lobules
+#   S5I  — Hot EREG embedding in Ki67-rich lobules
+#   S5J  — Mutual p16 ↔ Ki67 engagement in Ki67-rich lobules
+#
+# Prerequisite:
+#   Run "Figure5_complete.R" first (through Section 4). This script expects:
+#     - nn_data     (cleaned NN data with pace metrics)
+#     - epi_cells   (epithelial subset of nn_data)
+#
+# Dependencies:
+#   dplyr, tidyr, ggplot2, scales, sandwich, lmtest, ggeffects
+# ============================================================================
+
+
+# ============================================================================
+# 0.  ADDITIONAL PACKAGES (beyond Figure 5 setup)
+# ============================================================================
+
+suppressPackageStartupMessages({
+  library(sandwich)
+  library(lmtest)
+  library(ggeffects)
+})
+
+
+# ============================================================================
+# 1.  SHARED AESTHETICS & REUSABLE PLOTTING FUNCTIONS
+# ============================================================================
+
+text_color   <- "black"
+grid_color   <- "#E8E8E8"
+accent_color <- "#34495E"
+pre_color    <- "#3498DB"
+post_color   <- "#E74C3C"
+group_colors <- c("Pre-Menopause" = pre_color, "Post-Menopause" = post_color)
+
+#' Recode menopausal trajectory to display labels.
+label_trajectory <- function(x) {
+  factor(x, levels = c("Pre-Post", "Post-Post"),
+         labels = c("Pre-Menopause", "Post-Menopause"))
+}
+
+# --- Theme for simple scatter + regression (S5A–C) ---
+theme_scatter <- theme_classic(base_size = 14) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 24, hjust = 0.5),
+    axis.title.x  = element_text(size = 20, face = "bold"),
+    axis.title.y  = element_text(size = 20, face = "bold"),
+    axis.text.x   = element_text(size = 18),
+    axis.text.y   = element_text(size = 18)
+  )
+
+# --- Theme for OLS / logistic interaction plots (S5D–J) ---
+theme_interaction <- theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 28, color = text_color,
+                                  hjust = 0.5, margin = margin(b = 8)),
+    plot.subtitle = element_text(size = 22, color = text_color, hjust = 0.5,
+                                  lineheight = 1.2, margin = margin(b = 15)),
+    plot.caption  = element_text(size = 16, color = text_color, hjust = 0,
+                                  face = "italic", margin = margin(t = 10)),
+    axis.title.x  = element_text(face = "bold", size = 28, color = text_color,
+                                  margin = margin(t = 10), lineheight = 1.1),
+    axis.title.y  = element_text(face = "bold", size = 28, color = text_color,
+                                  margin = margin(r = 10), lineheight = 1.1),
+    axis.text     = element_text(size = 22, color = text_color),
+    axis.line     = element_line(color = accent_color, linewidth = 0.6),
+    panel.border  = element_rect(color = accent_color, fill = NA, linewidth = 0.8),
+    panel.grid.major = element_line(color = grid_color, linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.position    = "top",
+    legend.direction   = "horizontal",
+    legend.justification = "center",
+    legend.title       = element_text(face = "bold", size = 22, color = text_color),
+    legend.text        = element_text(size = 22, color = text_color),
+    legend.key.size    = unit(1.5, "cm"),
+    legend.spacing.x   = unit(0.5, "cm"),
+    legend.margin      = margin(b = 10),
+    plot.margin        = margin(10, 10, 10, 10)
+  )
+
+# --- Reusable function: OLS interaction plot (ribbon + points) ---
+#' @param pred       ggpredict object (x, predicted, conf.low, conf.high, group).
+#' @param raw        Woman-level data with x_col, y_col, meno.3group.
+#' @param x_col      Column name for x-axis in raw data.
+#' @param y_col      Column name for y-axis in raw data.
+#' @param b_int      Interaction beta estimate.
+#' @param p_int      Interaction p-value.
+#' @param xlab, ylab Axis label strings.
+#' @param title      Plot title.
+plot_ols_interaction <- function(pred, raw, x_col, y_col,
+                                 b_int, p_int, xlab, ylab, title) {
+  pred <- as.data.frame(pred)
+  pred$group <- label_trajectory(pred$group)
+  raw$meno_label <- label_trajectory(raw$meno.3group)
+
+  ggplot(pred, aes(x = x, y = predicted, color = group, fill = group)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.25, color = NA) +
+    geom_line(linewidth = 1.8, alpha = 0.9) +
+    geom_point(data = raw, aes(x = .data[[x_col]], y = .data[[y_col]],
+                                color = meno_label),
+               inherit.aes = FALSE, size = 5.5, alpha = 0.6, shape = 16) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = accent_color,
+               linewidth = 0.8, alpha = 0.7) +
+    scale_color_manual(values = group_colors, name = "Menopausal Status") +
+    scale_fill_manual(values  = group_colors, name = "Menopausal Status") +
+    scale_x_continuous(breaks = pretty_breaks(n = 8), expand = expansion(mult = 0.02)) +
+    scale_y_continuous(breaks = pretty_breaks(n = 8), expand = expansion(mult = 0.05)) +
+    labs(x = xlab, y = ylab, title = title,
+         subtitle = sprintf("Interaction \u03B2 = %.3f | p = %.4f", b_int, p_int)) +
+    theme_interaction
+}
+
+# --- Reusable function: hot lobule logistic plot (line + per-woman dots) ---
+#' @param pred          ggpredict object.
+#' @param woman_pts     Per-woman data with pace_z, frac_hot, meno.3group.
+#' @param b_int, p_int  Interaction coefficient and p-value.
+#' @param title, ylab   Plot title and y-axis label.
+plot_hot_lobule <- function(pred, woman_pts, b_int, p_int, title, ylab) {
+  pred <- as.data.frame(pred)
+  pred$group <- label_trajectory(pred$group)
+  woman_pts$meno_label <- label_trajectory(woman_pts$meno.3group)
+
+  ggplot(pred, aes(x = x, y = predicted, color = group, fill = group)) +
+    geom_line(linewidth = 1.8, alpha = 0.9) +
+    geom_point(data = woman_pts,
+               aes(x = pace_z, y = frac_hot, color = meno_label),
+               inherit.aes = FALSE, size = 6.5, alpha = 0.6, shape = 16) +
+    scale_color_manual(values = group_colors, name = "Menopausal Status") +
+    scale_fill_manual(values  = group_colors, name = "Menopausal Status") +
+    scale_x_continuous(breaks = pretty_breaks(n = 8), expand = expansion(mult = 0.02)) +
+    scale_y_continuous(breaks = pretty_breaks(n = 8), limits = c(0, 1),
+                       labels = percent_format(accuracy = 1),
+                       expand = expansion(mult = 0.02)) +
+    labs(x = "Involution Pace (z-score)", y = ylab, title = title,
+         subtitle = sprintf("Interaction \u03B2 = %.3f | p = %.3f", b_int, p_int),
+         caption = "'Hot' = lowest 20% of lobule-median distance") +
+    theme_interaction +
+    theme(axis.title.y = element_text(lineheight = 1.1))
+}
+
+
+# ============================================================================
+# 2.  SHARED DATA — Heterogeneity & pace metadata
+# ============================================================================
+# Reuses epi_cells and nn_data from Figure 5. Computes between-lobule
+# variance for EREG and pSTAT3, adds pace and trajectory metadata.
+
+cat("\n========================================\n")
+cat("  Computing heterogeneity metrics\n")
+cat("========================================\n")
+
+# --- Per-lobule fractions (already computed in Fig 5 but re-derived
+#     here so this script can run independently if needed) ---
+lobule_fractions_s5 <- epi_cells %>%
+  group_by(Patient_ID, `Annotation ID`) %>%
+  summarise(
+    frac_EREG   = mean(`Phenotype EREG`   == "EREG+",   na.rm = TRUE),
+    frac_pSTAT3 = mean(`Phenotype pSTAT3` == "pSTAT3+", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- Between-lobule variance per woman ---
+hub_df <- lobule_fractions_s5 %>%
+  group_by(Patient_ID) %>%
+  summarise(
+    var_EREG   = var(frac_EREG,   na.rm = TRUE),
+    var_pSTAT3 = var(frac_pSTAT3, na.rm = TRUE),
+    n_lobules  = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n_lobules >= 2) %>%
+  mutate(
+    var_EREG_z   = as.numeric(scale(var_EREG)),
+    var_pSTAT3_z = as.numeric(scale(var_pSTAT3))
+  ) %>%
+  left_join(
+    nn_data %>% select(Patient_ID, pace_index, meno.3group) %>% distinct(),
+    by = "Patient_ID"
+  ) %>%
+  filter(!is.na(pace_index), !is.na(meno.3group)) %>%
+  mutate(
+    meno.3group = factor(meno.3group, levels = c("Pre-Post", "Post-Post")),
+    pace_z = as.numeric(scale(pace_index))
+  )
+
+# --- Patient-level pace metadata (reused across S5D–J) ---
+pace_meta <- nn_data %>%
+  select(Patient_ID, pace_index, meno.3group) %>%
+  distinct() %>%
+  filter(!is.na(pace_index), !is.na(meno.3group))
+
+# --- Helper: Pearson r, p, n ---
+calc_stats <- function(x, y) {
+  ct <- cor.test(x, y, method = "pearson")
+  list(r = round(ct$estimate, 2), p = signif(ct$p.value, 2), n = length(na.omit(x)))
+}
+
+
+# ============================================================================
+# 3.  FIGURES S5A–C — Heterogeneity Decomposition
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Figures S5A\u2013C: Heterogeneity\n")
+cat("========================================\n")
+
+# --- S5A: EREG-driven heterogeneity vs pace ---
+stats_a <- calc_stats(hub_df$pace_z, hub_df$var_EREG_z)
+
+fig_s5a <- ggplot(hub_df, aes(x = pace_z, y = var_EREG_z)) +
+  geom_point(size = 5, color = "darkblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "darkblue", linewidth = 1) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.2, size = 6,
+           fontface = "bold",
+           label = paste0("r = ", stats_a$r, "\np = ", stats_a$p,
+                          "\nn = ", stats_a$n)) +
+  labs(x = "Involution Pace (z-scored)",
+       y = "EREG-Driven Heterogeneity (z)",
+       title = "EREG-Driven Heterogeneity vs Pace") +
+  theme_scatter
+
+print(fig_s5a)
+
+# --- S5B: pSTAT3-driven heterogeneity vs pace ---
+stats_b <- calc_stats(hub_df$pace_z, hub_df$var_pSTAT3_z)
+
+fig_s5b <- ggplot(hub_df, aes(x = pace_z, y = var_pSTAT3_z)) +
+  geom_point(size = 5, color = "darkblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "darkblue", linewidth = 1) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.2, size = 6,
+           fontface = "bold",
+           label = paste0("r = ", stats_b$r, "\np = ", stats_b$p,
+                          "\nn = ", stats_b$n)) +
+  labs(x = "Involution Pace (z-scored)",
+       y = "pSTAT3-Driven Heterogeneity (z)",
+       title = "pSTAT3-Driven Heterogeneity vs Pace") +
+  theme_scatter
+
+print(fig_s5b)
+
+# --- S5C: pSTAT3 vs EREG cross-correlation ---
+stats_c <- calc_stats(hub_df$var_EREG_z, hub_df$var_pSTAT3_z)
+
+fig_s5c <- ggplot(hub_df, aes(x = var_EREG_z, y = var_pSTAT3_z)) +
+  geom_point(size = 5, color = "darkblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "darkblue", linewidth = 1) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.1, vjust = -0.2, size = 6,
+           fontface = "bold",
+           label = paste0("r = ", stats_c$r, "\np = ", stats_c$p,
+                          "\nn = ", stats_c$n)) +
+  labs(x = "EREG-Driven Heterogeneity (z)",
+       y = "pSTAT3-Driven Heterogeneity (z)",
+       title = "pSTAT3 vs EREG Heterogeneity") +
+  theme_scatter
+
+print(fig_s5c)
+
+
+# ============================================================================
+# 4.  FIGURE S5D — Ki67⁺EREG⁻ → p16⁺ Distance × Trajectory (OLS)
+# ============================================================================
+# Per-woman median distance from all Ki67⁺EREG⁻ cells to nearest p16⁺ cell
+# (cell-pooled, not lobule-level). OLS with HC3 heteroskedasticity-robust SEs.
+
+cat("\n========================================\n")
+cat("  Figure S5D: Ki67\u207AEREG\u207B \u2192 p16\u207A Distance\n")
+cat("========================================\n")
+
+nn_data <- nn_data %>%
+  mutate(`Distance to p16+` = as.numeric(`Distance to p16+`))
+
+woman_s5d <- epi_cells %>%
+  filter(`Phenotype Ki67` == "Ki67+", `Phenotype EREG` == "EREG-") %>%
+  mutate(`Distance to p16+` = as.numeric(`Distance to p16+`)) %>%
+  group_by(Patient_ID) %>%
+  summarise(median_distance = median(`Distance to p16+`, na.rm = TRUE),
+            n_cells = n(), .groups = "drop") %>%
+  filter(is.finite(median_distance)) %>%
+  inner_join(pace_meta, by = "Patient_ID") %>%
+  mutate(
+    endpoint_z  = as.numeric(scale(log1p(median_distance))),
+    pace_z      = as.numeric(scale(pace_index)),
+    meno.3group = factor(meno.3group, levels = c("Pre-Post", "Post-Post"))
+  )
+
+fit_s5d    <- lm(pace_z ~ endpoint_z * meno.3group, data = woman_s5d)
+vcov_s5d   <- vcovHC(fit_s5d, type = "HC3")
+ct_s5d     <- coeftest(fit_s5d, vcov = vcov_s5d)
+b_int_s5d  <- ct_s5d["endpoint_z:meno.3groupPost-Post", "Estimate"]
+p_int_s5d  <- ct_s5d["endpoint_z:meno.3groupPost-Post", "Pr(>|t|)"]
+
+cat(sprintf("  Interaction \u03B2 = %.3f, p = %s\n", b_int_s5d, signif(p_int_s5d, 3)))
+
+pred_s5d <- ggpredict(fit_s5d, terms = c("endpoint_z", "meno.3group"))
+
+fig_s5d <- plot_ols_interaction(
+  pred_s5d, woman_s5d, x_col = "endpoint_z", y_col = "pace_z",
+  b_int = b_int_s5d, p_int = p_int_s5d,
+  xlab  = "Ki67\u207AEREG\u207B \u2192 p16\u207A Distance\n(z-scored log median per woman)",
+  ylab  = "Involution Pace (z-score)",
+  title = "Cell-Level Nearest Neighbor: Ki67\u207AEREG\u207B \u2192 p16\u207A"
+)
+
+print(fig_s5d)
+
+
+# ============================================================================
+# 5.  FIGURE S5E — Ki67⁺EREG⁻ → p16⁺ Cell-Level Adjacency (CF10)
+# ============================================================================
+# Fraction of Ki67⁺EREG⁻ epithelial cells with a p16⁺ neighbor ≤10 µm.
+
+cat("\n========================================\n")
+cat("  Figure S5E: Ki67\u207AEREG\u207B \u2192 p16\u207A CF10\n")
+cat("========================================\n")
+
+woman_s5e <- epi_cells %>%
+  filter(`Phenotype Ki67` == "Ki67+", `Phenotype EREG` == "EREG-") %>%
+  mutate(`Distance to p16+` = as.numeric(`Distance to p16+`)) %>%
+  group_by(Patient_ID) %>%
+  summarise(CF10 = mean(`Distance to p16+` <= 10, na.rm = TRUE),
+            n_cells = n(), .groups = "drop") %>%
+  filter(n_cells >= 5) %>%
+  inner_join(pace_meta, by = "Patient_ID") %>%
+  mutate(
+    CF10_z      = as.numeric(scale(CF10)),
+    meno.3group = factor(meno.3group, levels = c("Pre-Post", "Post-Post"))
+  )
+
+fit_s5e    <- lm(pace_index ~ CF10_z * meno.3group, data = woman_s5e)
+vcov_s5e   <- vcovHC(fit_s5e, type = "HC3")
+ct_s5e     <- coeftest(fit_s5e, vcov = vcov_s5e)
+b_int_s5e  <- ct_s5e["CF10_z:meno.3groupPost-Post", "Estimate"]
+p_int_s5e  <- ct_s5e["CF10_z:meno.3groupPost-Post", "Pr(>|t|)"]
+
+cat(sprintf("  Interaction \u03B2 = %.3f, p = %s\n", b_int_s5e, signif(p_int_s5e, 3)))
+
+pred_s5e <- ggpredict(fit_s5e, terms = c("CF10_z", "meno.3group"))
+
+fig_s5e <- plot_ols_interaction(
+  pred_s5e, woman_s5e, x_col = "CF10_z", y_col = "pace_index",
+  b_int = b_int_s5e, p_int = p_int_s5e,
+  xlab  = "Fraction Ki67\u207AEREG\u207B with p16\u207A \u226410 \u00B5m (z-score)",
+  ylab  = "Involution Pace",
+  title = "Cell Adjacency: Ki67\u207AEREG\u207B \u2192 p16\u207A"
+)
+
+print(fig_s5e)
+
+
+# ============================================================================
+# 6.  FIGURE S5F — Ki67⁺EREG⁺ → p16⁺ Cell-Level Adjacency (CF10)
+# ============================================================================
+# Same as S5E but for double-positive Ki67⁺EREG⁺ cells.
+
+cat("\n========================================\n")
+cat("  Figure S5F: Ki67\u207AEREG\u207A \u2192 p16\u207A CF10\n")
+cat("========================================\n")
+
+woman_s5f <- epi_cells %>%
+  filter(`Phenotype Ki67` == "Ki67+", `Phenotype EREG` == "EREG+") %>%
+  mutate(`Distance to p16+` = as.numeric(`Distance to p16+`)) %>%
+  group_by(Patient_ID) %>%
+  summarise(CF10 = mean(`Distance to p16+` <= 10, na.rm = TRUE),
+            n_cells = n(), .groups = "drop") %>%
+  filter(!is.na(CF10)) %>%
+  inner_join(pace_meta, by = "Patient_ID") %>%
+  mutate(
+    endpoint_z  = as.numeric(scale(CF10)),
+    pace_z      = as.numeric(scale(pace_index)),
+    meno.3group = factor(meno.3group, levels = c("Pre-Post", "Post-Post"))
+  )
+
+fit_s5f    <- lm(pace_z ~ endpoint_z * meno.3group, data = woman_s5f)
+vcov_s5f   <- vcovHC(fit_s5f, type = "HC3")
+ct_s5f     <- coeftest(fit_s5f, vcov = vcov_s5f)
+b_int_s5f  <- ct_s5f["endpoint_z:meno.3groupPost-Post", "Estimate"]
+p_int_s5f  <- ct_s5f["endpoint_z:meno.3groupPost-Post", "Pr(>|t|)"]
+
+cat(sprintf("  Interaction \u03B2 = %.3f, p = %s\n", b_int_s5f, signif(p_int_s5f, 3)))
+
+pred_s5f <- ggpredict(fit_s5f, terms = c("endpoint_z", "meno.3group"))
+
+fig_s5f <- plot_ols_interaction(
+  pred_s5f, woman_s5f, x_col = "endpoint_z", y_col = "pace_z",
+  b_int = b_int_s5f, p_int = p_int_s5f,
+  xlab  = "Fraction Ki67\u207AEREG\u207A with p16\u207A \u226410 \u00B5m (z-score)",
+  ylab  = "Involution Pace (z-score)",
+  title = "Cell Adjacency: Ki67\u207AEREG\u207A \u2192 p16\u207A"
+)
+
+print(fig_s5f)
+
+
+# ============================================================================
+# 7.  SHARED DATA FOR S5G–J — Ki67-Rich Lobule Infrastructure
+# ============================================================================
+# All four hot lobule analyses (S5G–J) start from the same Ki67⁺EREG⁻
+# source cells restricted to Ki67-rich lobules (≥5 source cells).
+
+cat("\n========================================\n")
+cat("  Building Ki67-rich lobule data\n")
+cat("========================================\n")
+
+nn_data <- nn_data %>%
+  mutate(
+    `Distance to p16+`  = as.numeric(`Distance to p16+`),
+    `Distance to CD16+` = as.numeric(`Distance to CD16+`),
+    `Distance to EREG+` = as.numeric(`Distance to EREG+`),
+    `Distance to Ki67+` = as.numeric(`Distance to Ki67+`)
+  )
+
+ki67_sources <- nn_data %>%
+  filter(`Tissue Category` == "Epithelial",
+         `Phenotype Ki67` == "Ki67+",
+         `Phenotype EREG` == "EREG-")
+
+# --- Lobule-level source counts and Ki67-rich filter ---
+ki67_lobule_counts <- ki67_sources %>%
+  group_by(Patient_ID, `Annotation ID`) %>%
+  summarise(n_sources = n(), .groups = "drop") %>%
+  filter(n_sources >= 5)
+
+ki67_rich_ids <- ki67_lobule_counts %>%
+  select(Patient_ID, `Annotation ID`, n_sources)
+
+cat("  Ki67-rich lobules:", nrow(ki67_rich_ids), "\n")
+
+# --- Helper: run hot lobule GLM pipeline ---
+#' @param lobule_dist  Tibble with Patient_ID, `Annotation ID`, median_dist.
+#' @param hot_col_name Name for the hot indicator column.
+#' @return List with glm fit, coeftest results, predictions, and woman points.
+run_hot_lobule_glm <- function(lobule_dist, hot_col_name) {
+  cutoff <- quantile(lobule_dist$median_dist, probs = 0.20, na.rm = TRUE)
+
+  lobule_df <- lobule_dist %>%
+    mutate(hot = as.integer(median_dist <= cutoff)) %>%
+    inner_join(pace_meta, by = "Patient_ID") %>%
+    filter(meno.3group %in% c("Pre-Post", "Post-Post")) %>%
+    mutate(
+      pace_z      = as.numeric(scale(pace_index)),
+      meno.3group = factor(meno.3group, levels = c("Pre-Post", "Post-Post"))
+    )
+
+  fit  <- glm(hot ~ pace_z * meno.3group, family = binomial(), data = lobule_df)
+  vcov <- vcovCL(fit, cluster = lobule_df$Patient_ID)
+  ct   <- coeftest(fit, vcov = vcov)
+
+  b_int <- ct["pace_z:meno.3groupPost-Post", "Estimate"]
+  p_int <- ct["pace_z:meno.3groupPost-Post", "Pr(>|z|)"]
+
+  pred <- ggpredict(fit, terms = c("pace_z", "meno.3group"))
+
+  woman_pts <- lobule_df %>%
+    group_by(Patient_ID, meno.3group) %>%
+    summarise(pace_z = first(pace_z), frac_hot = mean(hot),
+              n_lobules = n(), .groups = "drop")
+
+  list(fit = fit, b_int = b_int, p_int = p_int,
+       pred = pred, woman_pts = woman_pts)
+}
+
+
+# ============================================================================
+# 8.  FIGURE S5G — Hot p16-Embedded Proliferation
+# ============================================================================
+# Lobule-level: median distance from Ki67⁺EREG⁻ → p16⁺. Bottom 20% = hot.
+
+cat("\n========================================\n")
+cat("  Figure S5G: Hot p16-Embedded\n")
+cat("========================================\n")
+
+lobule_p16_dist <- ki67_sources %>%
+  semi_join(ki67_rich_ids, by = c("Patient_ID", "Annotation ID")) %>%
+  group_by(Patient_ID, `Annotation ID`) %>%
+  summarise(median_dist = median(`Distance to p16+`, na.rm = TRUE),
+            .groups = "drop")
+
+res_s5g <- run_hot_lobule_glm(lobule_p16_dist, "hot_p16_embedded")
+cat(sprintf("  Interaction \u03B2 = %.3f, p = %s\n",
+            res_s5g$b_int, signif(res_s5g$p_int, 3)))
+
+fig_s5g <- plot_hot_lobule(
+  res_s5g$pred, res_s5g$woman_pts,
+  b_int = res_s5g$b_int, p_int = res_s5g$p_int,
+  title = "p16-Embedded Proliferation in Ki67-Rich Lobules",
+  ylab  = "Probability of\nHot p16 Embedding"
+)
+
+print(fig_s5g)
+
+
+# ============================================================================
+# 9.  FIGURE S5H — Hot CD16 Engagement
+# ============================================================================
+# Lobule-level: median distance from Ki67⁺EREG⁻ → CD16⁺. Bottom 20% = hot.
+
+cat("\n========================================\n")
+cat("  Figure S5H: Hot CD16 Engagement\n")
+cat("========================================\n")
+
+lobule_cd16_dist <- ki67_sources %>%
+  semi_join(ki67_rich_ids, by = c("Patient_ID", "Annotation ID")) %>%
+  group_by(Patient_ID, `Annotation ID`) %>%
+  summarise(median_dist = median(`Distance to CD16+`, na.rm = TRUE),
+            .groups = "drop")
+
+res_s5h <- run_hot_lobule_glm(lobule_cd16_dist, "hot_cd16_engaged")
+cat(sprintf("  Interaction \u03B2 = %.3f, p = %s\n",
+            res_s5h$b_int, signif(res_s5h$p_int, 3)))
+
+fig_s5h <- plot_hot_lobule(
+  res_s5h$pred, res_s5h$woman_pts,
+  b_int = res_s5h$b_int, p_int = res_s5h$p_int,
+  title = "CD16 Engagement in Ki67-Rich Lobules",
+  ylab  = "Probability of\nHot CD16 Engagement"
+)
+
+print(fig_s5h)
+
+
+# ============================================================================
+# 10. FIGURE S5I — Hot EREG Embedding
+# ============================================================================
+# Lobule-level: median distance from Ki67⁺EREG⁻ → EREG⁺. Bottom 20% = hot.
+
+cat("\n========================================\n")
+cat("  Figure S5I: Hot EREG Embedding\n")
+cat("========================================\n")
+
+lobule_ereg_dist <- ki67_sources %>%
+  semi_join(ki67_rich_ids, by = c("Patient_ID", "Annotation ID")) %>%
+  group_by(Patient_ID, `Annotation ID`) %>%
+  summarise(median_dist = median(`Distance to EREG+`, na.rm = TRUE),
+            .groups = "drop")
+
+res_s5i <- run_hot_lobule_glm(lobule_ereg_dist, "hot_ereg_embedded")
+cat(sprintf("  Interaction \u03B2 = %.3f, p = %s\n",
+            res_s5i$b_int, signif(res_s5i$p_int, 3)))
+
+fig_s5i <- plot_hot_lobule(
+  res_s5i$pred, res_s5i$woman_pts,
+  b_int = res_s5i$b_int, p_int = res_s5i$p_int,
+  title = "EREG Embedding in Ki67-Rich Lobules",
+  ylab  = "Probability of\nHot EREG Embedding"
+)
+
+print(fig_s5i)
+
+
+# ============================================================================
+# 11. FIGURE S5J — Mutual p16 ↔ Ki67 Engagement
+# ============================================================================
+# A lobule has "mutual engagement" when BOTH:
+#   (a) Ki67⁺EREG⁻ → p16⁺ median distance is in the bottom 20% (hot), AND
+#   (b) p16⁺EREG⁻ → Ki67⁺ CF10 is in the top 20% (high reciprocal adjacency).
+
+cat("\n========================================\n")
+cat("  Figure S5J: Mutual Engagement\n")
+cat("========================================\n")
+
+# --- Forward criterion: hot p16-embedded (from S5G) ---
+cutoff_p16 <- quantile(lobule_p16_dist$median_dist, probs = 0.20, na.rm = TRUE)
+
+ki67_rich_with_p16 <- ki67_rich_ids %>%
+  left_join(lobule_p16_dist, by = c("Patient_ID", "Annotation ID")) %>%
+  mutate(hot_p16 = as.integer(median_dist <= cutoff_p16))
+
+# --- Reverse criterion: p16⁺EREG⁻ → Ki67⁺ CF10 ---
+p16_cf10 <- nn_data %>%
+  filter(`Tissue Category` == "Epithelial",
+         `Phenotype p16` == "p16+",
+         `Phenotype EREG` == "EREG-") %>%
+  group_by(Patient_ID, `Annotation ID`) %>%
+  summarise(cf10_reverse = mean(`Distance to Ki67+` <= 10, na.rm = TRUE),
+            .groups = "drop")
+
+lob_mutual <- ki67_rich_with_p16 %>%
+  left_join(p16_cf10, by = c("Patient_ID", "Annotation ID")) %>%
+  mutate(cf10_reverse = tidyr::replace_na(cf10_reverse, 0))
+
+cutoff_cf10 <- quantile(lob_mutual$cf10_reverse, probs = 0.80, na.rm = TRUE)
+
+lobule_mutual_dist <- lob_mutual %>%
+  mutate(
+    high_cf10 = as.integer(cf10_reverse >= cutoff_cf10),
+    # Use median_dist as the continuous variable but hot outcome is the AND
+    hot = as.integer(hot_p16 == 1 & high_cf10 == 1)
+  )
+
+# --- GLM (manual, since outcome is pre-computed) ---
+lobule_mutual_df <- lobule_mutual_dist %>%
+  inner_join(pace_meta, by = "Patient_ID") %>%
+  filter(meno.3group %in% c("Pre-Post", "Post-Post")) %>%
+  mutate(
+    pace_z      = as.numeric(scale(pace_index)),
+    meno.3group = factor(meno.3group, levels = c("Pre-Post", "Post-Post"))
+  )
+
+fit_s5j  <- glm(hot ~ pace_z * meno.3group, family = binomial(),
+                 data = lobule_mutual_df)
+vcov_s5j <- vcovCL(fit_s5j, cluster = lobule_mutual_df$Patient_ID)
+ct_s5j   <- coeftest(fit_s5j, vcov = vcov_s5j)
+b_int_s5j <- ct_s5j["pace_z:meno.3groupPost-Post", "Estimate"]
+p_int_s5j <- ct_s5j["pace_z:meno.3groupPost-Post", "Pr(>|z|)"]
+
+cat(sprintf("  Interaction \u03B2 = %.3f, p = %s\n",
+            b_int_s5j, signif(p_int_s5j, 3)))
+
+pred_s5j <- ggpredict(fit_s5j, terms = c("pace_z", "meno.3group"))
+
+woman_pts_s5j <- lobule_mutual_df %>%
+  group_by(Patient_ID, meno.3group) %>%
+  summarise(pace_z = first(pace_z), frac_hot = mean(hot),
+            n_lobules = n(), .groups = "drop")
+
+fig_s5j <- plot_hot_lobule(
+  pred_s5j, woman_pts_s5j,
+  b_int = b_int_s5j, p_int = p_int_s5j,
+  title = "Mutual p16 \u2194 Ki67 Engagement in Ki67-Rich Lobules",
+  ylab  = "Probability of\nMutual Engagement"
+)
+
+print(fig_s5j)
+
+
+# ============================================================================
+# 12. SESSION COMPLETE
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Supplementary Figure S5 Complete\n")
+cat("========================================\n")
+cat("  Figures: S5A\u2013J (10 panels)\n")
