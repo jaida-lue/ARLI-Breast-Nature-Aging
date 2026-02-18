@@ -1,0 +1,1439 @@
+# ============================================================================
+# Figure 6 — Data Preparation & Figures 6C, 6D, 6G, 6H, 6I, 6J, 6K,
+#             S6A, S6B, S6C, S6D
+# Stall-Hub and Clearance-Hub Spatial Niche Analyses
+# ============================================================================
+#
+# Description:
+#   Loads and prepares spatial nearest-neighbor (NN) data from the
+#   senescence/proliferation multiplex panel (same panel as Figure 5),
+#   then generates figures characterizing two classes of spatial niches:
+#
+#   STALL-HUBS: Lobules where both senescent (p16+) and innate immune
+#   (CD16+) cells are spatially proximal to pSTAT3+ signaling cells.
+#   These convergent niches may represent sites of paracrine stalling.
+#
+#   CLEARANCE-HUBS: Lobules where CD16+ cells are both spatially close
+#   to p16+ senescent cells AND abundant (top 20%), suggesting active
+#   immune surveillance and senescent cell clearance.
+#
+# Figures produced:
+#   Fig 6C  — Stall-hub classification scatter: p16+->pSTAT3+ distance
+#             vs CD16+->pSTAT3+ distance, with 20th percentile cutoffs.
+#   Fig 6D  — Per-woman stall-hub fraction vs involution pace (Pearson r).
+#   Fig 6G  — Clearance-hub classification scatter: CD16+->p16+ distance
+#             vs CD16+ fraction, with cutoffs for both axes.
+#   Fig 6H  — Clearance-hub probability vs involution pace (Bayesian
+#             mixed logistic regression with woman random intercepts).
+#   Fig 6I  — Mechanistic integration: (i) Ki67+ co-expressing pSTAT3+,
+#             (ii) p16+->EREG+ distance, (iii) Ki67+ epithelial fraction,
+#             all comparing stall-hub vs non-stall lobules.
+#   Fig 6J  — Forest plot: odds ratios per +1 SD pace for Pre->Post,
+#             Post->Post, and interaction term.
+#   Fig 6K  — DBSCAN spatial validation: pSTAT3 clustering and p16-CD16
+#             engagement boxplots (stall vs clearance hubs) at eps=12,
+#             plus eps sensitivity plots across 6-14 um.
+#   Fig S6A — Stall-hub forest plot: lobule-level OR per +1 SD pace
+#             with woman-clustered SEs.
+#   Fig S6B — Per-woman lobule class composition stacked bar chart,
+#             ordered by involution pace.
+#   Fig S6C — Per-woman mean and max epithelial pSTAT3+ fractions
+#             vs involution pace.
+#   Fig S6D — Posterior density of the pace x trajectory interaction.
+#
+# Inputs (place in DATA_DIR):
+#   - senescence_prolif_NN_data.txt       Tab-delimited NN export
+#   - pace_metrics_senescence_prolif.xlsx  Clinical metadata
+#
+# Dependencies:
+#   dplyr, tidyr, stringr, readr, readxl, ggplot2, scales, forcats,
+#   sandwich, lmtest, dbscan, brms, posterior
+# ============================================================================
+
+
+# ============================================================================
+# 0.  SETUP — Load packages
+# ============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(readr)
+  library(readxl)
+  library(ggplot2)
+  library(scales)
+  library(forcats)
+  library(sandwich)
+  library(lmtest)
+  library(dbscan)
+  library(brms)
+  library(posterior)
+})
+
+
+# ============================================================================
+# 1.  FILE PATHS & CONSTANTS
+# ============================================================================
+
+DATA_DIR <- "data"
+OUT_DIR  <- "output"
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+nn_path   <- file.path(DATA_DIR, "senescence_prolif_NN_data.txt")
+pace_path <- file.path(DATA_DIR, "pace_metrics_senescence_prolif.xlsx")
+
+# Patients to exclude (QC failures)
+patients_exclude <- c("C31183", "C38385")
+
+
+# ============================================================================
+# 2.  HELPER FUNCTIONS
+# ============================================================================
+
+#' Extract patient ID from an Annotation ID string.
+#' Loads corrections from an external mapping file for patients whose
+#' imaging annotation prefixes are abbreviated.
+extract_patient_id <- function(annotation_ids) {
+  ids <- str_extract(annotation_ids, "(?<=^[PS]_)[A-Z0-9]+")
+
+  id_corrections_path <- file.path(DATA_DIR, "patient_id_corrections.csv")
+  if (file.exists(id_corrections_path)) {
+    corrections <- read_csv(id_corrections_path, show_col_types = FALSE)
+    for (i in seq_len(nrow(corrections))) {
+      ids[ids == corrections$annotation_id[i]] <- corrections$clinical_id[i]
+    }
+  }
+
+  return(ids)
+}
+
+#' Recode menopausal trajectory to display labels.
+label_trajectory <- function(x) {
+  factor(x, levels = c("Pre-Post", "Post-Post"),
+         labels = c("Pre-Menopause", "Post-Menopause"))
+}
+
+
+# ============================================================================
+# 3.  SHARED PLOT AESTHETICS
+# ============================================================================
+
+text_color   <- "black"
+grid_color   <- "#E8E8E8"
+accent_color <- "#34495E"
+pre_color    <- "#3498DB"
+post_color   <- "#E74C3C"
+group_colors <- c("Pre-Menopause" = pre_color, "Post-Menopause" = post_color)
+
+# Hub classification color scheme (used in 6C and S6B)
+hub_colors_border <- c(
+  "Hub"            = "#7D3C98",
+  "Innate-only"    = "#E74C3C",
+  "Senescent-only" = "#3498DB",
+  "Neutral"        = "grey55"
+)
+hub_colors_fill <- c(
+  "Hub"            = "#D7BDE2",
+  "Innate-only"    = "#F5B7B1",
+  "Senescent-only" = "#AED6F1",
+  "Neutral"        = "white"
+)
+hub_shapes <- c(
+  "Hub"            = 21,
+  "Innate-only"    = 24,
+  "Senescent-only" = 22,
+  "Neutral"        = 21
+)
+
+
+# ============================================================================
+# 4.  LOAD & PREPARE DATA
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Loading Senescence/Proliferation Panel\n")
+cat("========================================\n")
+
+# 4a. Read tab-delimited NN export
+nn_data <- read.table(
+  nn_path,
+  header = TRUE, sep = "\t", quote = "", check.names = FALSE,
+  fill = TRUE, comment.char = "", row.names = NULL
+)
+
+# 4b. Extract patient IDs
+nn_data <- nn_data %>%
+  mutate(Patient_ID = extract_patient_id(`Annotation ID`))
+
+# 4c. Merge clinical pace metrics
+pace_metrics <- read_excel(pace_path)
+nn_data <- nn_data %>%
+  left_join(pace_metrics, by = "Patient_ID")
+
+# 4d. Remove excluded patients
+nn_data <- nn_data %>%
+  filter(!Patient_ID %in% patients_exclude)
+
+stopifnot(!any(nn_data$Patient_ID %in% patients_exclude))
+
+# 4e. Ensure all distance columns are numeric
+nn_data <- nn_data %>%
+  mutate(
+    `Distance to pSTAT3+` = as.numeric(`Distance to pSTAT3+`),
+    `Distance to p16+`    = as.numeric(`Distance to p16+`),
+    `Distance to CD16+`   = as.numeric(`Distance to CD16+`),
+    `Distance to Ki67+`   = as.numeric(`Distance to Ki67+`),
+    `Distance to EREG+`   = as.numeric(`Distance to EREG+`)
+  )
+
+cat("  Unique patients:", n_distinct(nn_data$Patient_ID), "\n")
+cat("  Total cells:", nrow(nn_data), "\n")
+
+# 4f. Patient-level pace metadata (reused across figures)
+pace_meta <- nn_data %>%
+  select(Patient_ID, pace_index, meno.3group) %>%
+  distinct() %>%
+  filter(!is.na(pace_index), !is.na(meno.3group))
+
+
+# ============================================================================
+# 5.  FIGURE 6C — Stall-Hub Classification
+# ============================================================================
+# A "stall-hub" is a lobule where BOTH senescent cells (p16⁺) AND innate
+# immune cells (CD16⁺) are spatially close to pSTAT3⁺ signaling cells
+# (within the 20th percentile of median distance). This convergence may
+# indicate a paracrine signaling niche that promotes involution stalling.
+#
+# Classification:
+#   Hub            — both p16 and CD16 proximal to pSTAT3
+#   Innate-only    — only CD16 proximal to pSTAT3
+#   Senescent-only — only p16 proximal to pSTAT3
+#   Neutral        — neither proximal
+
+cat("\n========================================\n")
+cat("  Figure 6C: Stall-Hub Classification\n")
+cat("========================================\n")
+
+# --- Median p16⁺ → pSTAT3⁺ distance per lobule (epithelial p16 only) ---
+lobule_p16_dist <- nn_data %>%
+  filter(`Phenotype p16` == "p16+", `Tissue Category` == "Epithelial") %>%
+  group_by(`Annotation ID`) %>%
+  summarise(med_p16_pstat3 = median(`Distance to pSTAT3+`, na.rm = TRUE),
+            .groups = "drop")
+
+# --- Median CD16⁺ → pSTAT3⁺ distance per lobule, by compartment ---
+lobule_cd16_epi_pstat3 <- nn_data %>%
+  filter(`Phenotype CD16` == "CD16+", `Tissue Category` == "Epithelial") %>%
+  group_by(`Annotation ID`) %>%
+  summarise(med_cd16_epi_pstat3 = median(`Distance to pSTAT3+`, na.rm = TRUE),
+            .groups = "drop")
+
+lobule_cd16_str_pstat3 <- nn_data %>%
+  filter(`Phenotype CD16` == "CD16+", `Tissue Category` == "Stroma") %>%
+  group_by(`Annotation ID`) %>%
+  summarise(med_cd16_str_pstat3 = median(`Distance to pSTAT3+`, na.rm = TRUE),
+            .groups = "drop")
+
+# --- Combine: use the closer of epithelial or stromal CD16 ---
+lobule_dists <- lobule_p16_dist %>%
+  left_join(lobule_cd16_epi_pstat3, by = "Annotation ID") %>%
+  left_join(lobule_cd16_str_pstat3, by = "Annotation ID") %>%
+  mutate(
+    med_cd16_any_pstat3 = pmin(med_cd16_epi_pstat3, med_cd16_str_pstat3,
+                               na.rm = TRUE)
+  )
+
+# --- 20th percentile cutoffs ---
+q20_p16    <- quantile(lobule_dists$med_p16_pstat3,    0.2, na.rm = TRUE)
+q20_cd16   <- quantile(lobule_dists$med_cd16_any_pstat3, 0.2, na.rm = TRUE)
+
+cat(sprintf("  p16\u207A \u2192 pSTAT3\u207A 20th pctl: %.2f \u00B5m\n", q20_p16))
+cat(sprintf("  CD16\u207A \u2192 pSTAT3\u207A 20th pctl: %.2f \u00B5m\n", q20_cd16))
+
+# --- Classify lobules ---
+lobule_dists <- lobule_dists %>%
+  mutate(
+    sen_hot = med_p16_pstat3     <= q20_p16,
+    inn_hot = med_cd16_any_pstat3 <= q20_cd16,
+    hub_class = factor(
+      case_when(
+        sen_hot & inn_hot  ~ "Hub",
+        !sen_hot & inn_hot ~ "Innate-only",
+        sen_hot & !inn_hot ~ "Senescent-only",
+        TRUE               ~ "Neutral"
+      ),
+      levels = c("Hub", "Innate-only", "Senescent-only", "Neutral")
+    )
+  )
+
+class_summary <- table(lobule_dists$hub_class)
+cat("  Hub:", class_summary["Hub"], "| Innate-only:", class_summary["Innate-only"],
+    "| Senescent-only:", class_summary["Senescent-only"],
+    "| Neutral:", class_summary["Neutral"], "\n")
+
+# --- Plot ---
+fig6c <- ggplot(lobule_dists,
+  aes(x = med_p16_pstat3, y = med_cd16_any_pstat3,
+      shape = hub_class, color = hub_class, fill = hub_class)) +
+  geom_vline(xintercept = q20_p16, linetype = "dashed", color = "grey40",
+             linewidth = 0.8) +
+  geom_hline(yintercept = q20_cd16, linetype = "dashed", color = "grey40",
+             linewidth = 0.8) +
+  geom_point(alpha = 0.85, size = 5, stroke = 1) +
+  scale_color_manual(name = "Classification", values = hub_colors_border) +
+  scale_fill_manual(name  = "Classification", values = hub_colors_fill) +
+  scale_shape_manual(name = "Classification", values = hub_shapes) +
+  labs(
+    x = "Median p16\u207A \u2192 pSTAT3\u207A Distance (\u00B5m)",
+    y = "Median CD16\u207A \u2192 pSTAT3\u207A Distance (\u00B5m)"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.title   = element_text(size = 22, face = "bold"),
+    axis.text    = element_text(size = 22),
+    legend.position = c(0.75, 0.55),
+    legend.justification = c(0.5, 0.5),
+    legend.background = element_rect(fill = "white", color = "black",
+                                      linewidth = 0.5),
+    legend.title = element_text(size = 24, face = "bold"),
+    legend.text  = element_text(size = 22),
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+    plot.margin = margin(15, 15, 15, 5)
+  )
+
+print(fig6c)
+
+
+# ============================================================================
+# 6.  FIGURE 6D — Stall-Hub Fraction vs Involution Pace
+# ============================================================================
+# For each woman, compute the fraction of lobules classified as stall-hubs,
+# then test the Pearson correlation with involution pace.
+
+cat("\n========================================\n")
+cat("  Figure 6D: Stall-Hub Fraction vs Pace\n")
+cat("========================================\n")
+
+# --- Attach patient metadata to lobule classifications ---
+lobule_dists_full <- lobule_dists %>%
+  left_join(
+    nn_data %>%
+      select(`Annotation ID`, Patient_ID, meno.3group, pace_index) %>%
+      distinct(),
+    by = "Annotation ID"
+  ) %>%
+  filter(!is.na(Patient_ID), !is.na(pace_index), !is.na(meno.3group))
+
+# --- Per-woman stall-hub fraction ---
+woman_hub_frac <- lobule_dists_full %>%
+  group_by(Patient_ID, meno.3group) %>%
+  summarise(
+    frac_hub   = mean(hub_class == "Hub"),
+    n_lobules  = n(),
+    pace_index = first(pace_index),
+    .groups = "drop"
+  ) %>%
+  mutate(meno_label = label_trajectory(meno.3group))
+
+# --- Correlation test ---
+cor_6d  <- cor.test(woman_hub_frac$pace_index, woman_hub_frac$frac_hub,
+                    method = "pearson")
+r_val   <- round(cor_6d$estimate, 3)
+p_val   <- signif(cor_6d$p.value, 3)
+n_women <- nrow(woman_hub_frac)
+
+cat(sprintf("  r = %s, p = %s, n = %d\n", r_val, p_val, n_women))
+
+# --- Plot ---
+fig6d <- ggplot(woman_hub_frac, aes(x = pace_index, y = frac_hub)) +
+  geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 1.2) +
+  geom_point(aes(color = meno_label), size = 4.5, alpha = 0.85, stroke = 0.5) +
+  scale_color_manual(
+    values = c("Pre-Menopause" = "red", "Post-Menopause" = "blue"),
+    name = "Menopause Status"
+  ) +
+  labs(
+    x = "Involution Pace Index",
+    y = "Per-Woman Stall-Hub Fraction",
+    subtitle = sprintf("r = %s, p = %s, n = %d", r_val, p_val, n_women)
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.subtitle = element_text(size = 18, hjust = 0.5, margin = margin(b = 15)),
+    axis.title.x  = element_text(face = "bold", size = 24, margin = margin(t = 12)),
+    axis.title.y  = element_text(face = "bold", size = 24, margin = margin(r = 12)),
+    axis.text     = element_text(size = 18, color = "black"),
+    axis.line     = element_line(linewidth = 1),
+    axis.ticks    = element_line(linewidth = 1),
+    axis.ticks.length = unit(0.2, "cm"),
+    legend.title  = element_text(face = "bold", size = 19),
+    legend.text   = element_text(size = 17),
+    legend.position   = "bottom",
+    legend.direction  = "horizontal",
+    legend.key.size   = unit(1.2, "lines"),
+    legend.background = element_rect(fill = "white", color = NA),
+    panel.background  = element_rect(fill = "white", color = NA),
+    plot.background   = element_rect(fill = "white", color = NA),
+    plot.margin       = margin(20, 20, 20, 20)
+  )
+
+print(fig6d)
+
+
+# ============================================================================
+# 7.  FIGURE S6B — Lobule Class Composition Across Involution Pace
+# ============================================================================
+# Stacked bar chart: each bar is one woman, ordered by involution pace
+# (slow → fast). Shows the proportional composition of her lobules across
+# the four classification categories.
+
+cat("\n========================================\n")
+cat("  Figure S6B: Lobule Composition\n")
+cat("========================================\n")
+
+# --- Per-woman fractions of each lobule class ---
+woman_lobule_frac <- lobule_dists_full %>%
+  group_by(Patient_ID, hub_class) %>%
+  summarise(n_lobules = n(), pace_index = first(pace_index), .groups = "drop") %>%
+  group_by(Patient_ID) %>%
+  mutate(frac = n_lobules / sum(n_lobules), total_lobules = sum(n_lobules)) %>%
+  ungroup()
+
+# --- Order women by pace ---
+woman_order <- woman_lobule_frac %>%
+  distinct(Patient_ID, pace_index) %>%
+  arrange(pace_index)
+
+woman_lobule_frac <- woman_lobule_frac %>%
+  mutate(
+    Patient_ID = factor(Patient_ID, levels = woman_order$Patient_ID),
+    # Stack order: Neutral at bottom, Hub at top
+    hub_class  = factor(hub_class,
+                        levels = c("Neutral", "Innate-only",
+                                   "Senescent-only", "Hub"))
+  )
+
+n_women_s6b <- n_distinct(woman_lobule_frac$Patient_ID)
+
+# --- Plot ---
+fig_s6b <- ggplot(woman_lobule_frac,
+                  aes(x = Patient_ID, y = frac, fill = hub_class)) +
+  geom_col(width = 1, color = "white", linewidth = 0.3) +
+  scale_fill_manual(
+    name = "Lobule Classification",
+    values = c(
+      "Hub"            = "#7D3C98",
+      "Senescent-only" = "#3498DB",
+      "Innate-only"    = "#E74C3C",
+      "Neutral"        = "grey70"
+    ),
+    labels = c(
+      "Hub"            = "Stall-Hub",
+      "Senescent-only" = "Senescent-only",
+      "Innate-only"    = "Innate-only",
+      "Neutral"        = "Neutral"
+    )
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     expand = c(0, 0), breaks = seq(0, 1, 0.2)) +
+  # Pace gradient annotation
+  annotate("text", x = 1, y = -0.1,
+           label = "SLOW", size = 4, fontface = "bold", color = "#2E86AB",
+           hjust = 0) +
+  annotate("text", x = n_women_s6b, y = -0.1,
+           label = "FAST", size = 4, fontface = "bold", color = "#D62828",
+           hjust = 1) +
+  annotate("segment", x = 1, xend = n_women_s6b, y = -0.05, yend = -0.05,
+           arrow = arrow(length = unit(0.3, "cm"), type = "closed"),
+           color = "grey40", linewidth = 0.8) +
+  labs(
+    x = sprintf("Individual Women (N = %d) Ordered by Involution Pace",
+                n_women_s6b),
+    y = "Proportion of Lobules",
+    title = "Lobule Class Composition Varies Across Involution Pace",
+    subtitle = sprintf("Total lobules = %d", nrow(lobule_dists_full))
+  ) +
+  coord_cartesian(ylim = c(-0.08, 1.02), clip = "off") +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.4),
+    panel.grid.minor   = element_blank(),
+    panel.background   = element_rect(fill = "white", color = NA),
+    plot.background    = element_rect(fill = "white", color = NA),
+    plot.title    = element_text(size = 24, face = "bold", hjust = 0.5,
+                                  margin = margin(b = 8)),
+    plot.subtitle = element_text(size = 14, color = "grey30", hjust = 0.5,
+                                  margin = margin(b = 15)),
+    axis.title.x  = element_text(size = 20, face = "bold",
+                                  margin = margin(t = 12), color = "grey20"),
+    axis.title.y  = element_text(size = 20, face = "bold",
+                                  margin = margin(r = 12), color = "grey20"),
+    axis.text.y   = element_text(size = 18, color = "grey20"),
+    axis.text.x   = element_blank(),
+    axis.ticks.x  = element_blank(),
+    axis.line.x   = element_line(color = "grey60", linewidth = 0.5),
+    axis.line.y   = element_line(color = "grey60", linewidth = 0.5),
+    legend.position  = "top",
+    legend.title     = element_text(size = 14, face = "bold"),
+    legend.text      = element_text(size = 11),
+    legend.key.height = unit(0.8, "cm"),
+    legend.key.width  = unit(1.2, "cm"),
+    legend.margin     = margin(b = 10),
+    plot.margin       = margin(20, 25, 20, 20)
+  )
+
+print(fig_s6b)
+
+
+# ============================================================================
+# 8.  FIGURE 6G — Clearance-Hub Classification
+# ============================================================================
+# A "clearance-hub" is a lobule where CD16⁺ innate immune cells are BOTH:
+#   (a) spatially close to p16⁺ senescent cells (bottom 20% of distance), AND
+#   (b) abundant (top 20% of CD16⁺ fraction in epithelium OR stroma).
+# This dual criterion identifies lobules with active immune surveillance.
+
+cat("\n========================================\n")
+cat("  Figure 6G: Clearance-Hub Classification\n")
+cat("========================================\n")
+
+# --- Median CD16⁺ → p16⁺ distance per lobule, by compartment ---
+lobule_cd16_epi_p16 <- nn_data %>%
+  filter(`Phenotype CD16` == "CD16+", `Tissue Category` == "Epithelial") %>%
+  group_by(`Annotation ID`) %>%
+  summarise(med_cd16_epi_p16 = median(`Distance to p16+`, na.rm = TRUE),
+            .groups = "drop")
+
+lobule_cd16_str_p16 <- nn_data %>%
+  filter(`Phenotype CD16` == "CD16+", `Tissue Category` == "Stroma") %>%
+  group_by(`Annotation ID`) %>%
+  summarise(med_cd16_str_p16 = median(`Distance to p16+`, na.rm = TRUE),
+            .groups = "drop")
+
+# --- CD16⁺ fraction per lobule, by compartment ---
+cd16_frac <- nn_data %>%
+  group_by(`Annotation ID`, `Tissue Category`) %>%
+  summarise(
+    n_cd16  = sum(`Phenotype CD16` == "CD16+"),
+    n_total = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(frac_cd16 = n_cd16 / n_total) %>%
+  select(`Annotation ID`, `Tissue Category`, frac_cd16) %>%
+  pivot_wider(names_from = `Tissue Category`, values_from = frac_cd16,
+              names_prefix = "frac_cd16_", values_fill = 0)
+
+# --- Combine distances and abundance ---
+lobule_clear <- lobule_cd16_epi_p16 %>%
+  left_join(lobule_cd16_str_p16, by = "Annotation ID") %>%
+  left_join(cd16_frac, by = "Annotation ID") %>%
+  mutate(
+    med_cd16_any_p16 = pmin(med_cd16_epi_p16, med_cd16_str_p16, na.rm = TRUE),
+    frac_cd16_epi = frac_cd16_Epithelial,
+    frac_cd16_str = frac_cd16_Stroma
+  )
+
+# --- Cutoffs ---
+q20_cd16_p16  <- quantile(lobule_clear$med_cd16_any_p16, 0.2, na.rm = TRUE)
+q80_cd16_epi  <- quantile(lobule_clear$frac_cd16_epi, 0.8, na.rm = TRUE)
+q80_cd16_str  <- quantile(lobule_clear$frac_cd16_str, 0.8, na.rm = TRUE)
+
+cat(sprintf("  CD16\u207A \u2192 p16\u207A 20th pctl: %.2f \u00B5m\n", q20_cd16_p16))
+cat(sprintf("  CD16\u207A fraction 80th pctl (epi): %.4f | (stroma): %.4f\n",
+            q80_cd16_epi, q80_cd16_str))
+
+# --- Classify ---
+lobule_clear <- lobule_clear %>%
+  mutate(
+    cd16_high_any  = (frac_cd16_epi >= q80_cd16_epi) |
+                     (frac_cd16_str >= q80_cd16_str),
+    clearance_hub  = (med_cd16_any_p16 <= q20_cd16_p16) & cd16_high_any
+  )
+
+cat("  Clearance hubs:", sum(lobule_clear$clearance_hub),
+    "/", nrow(lobule_clear), "lobules\n")
+
+# --- Plot ---
+fig6g <- ggplot(
+  lobule_clear,
+  aes(x = med_cd16_any_p16,
+      y = pmax(frac_cd16_epi, frac_cd16_str))
+) +
+  geom_vline(xintercept = q20_cd16_p16, linetype = "dashed", color = "grey30",
+             linewidth = 1) +
+  geom_hline(yintercept = pmax(q80_cd16_epi, q80_cd16_str), linetype = "dashed",
+             color = "grey30", linewidth = 1) +
+  geom_point(aes(color = clearance_hub), size = 4, alpha = 0.75) +
+  scale_color_manual(
+    values = c(`TRUE` = "#2C7BE5", `FALSE` = "grey60"),
+    labels = c(`TRUE` = "Clearance Hub", `FALSE` = "Other")
+  ) +
+  labs(
+    x = "Median CD16\u207A \u2192 p16\u207A Distance (\u00B5m)",
+    y = "CD16 Fraction (max of epi/stroma)",
+    title = "Clearance-Hub: CD16 Engagement + High Abundance",
+    subtitle = sprintf(
+      "Distance cutoff = %.1f \u00B5m (20th pctl) | Abundance cutoff = top 20%% in epi OR stroma",
+      q20_cd16_p16
+    )
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    plot.title    = element_text(size = 26, face = "bold", hjust = 0.5,
+                                  margin = margin(b = 8)),
+    plot.subtitle = element_text(size = 18, color = "grey30", hjust = 0.5,
+                                  margin = margin(b = 15)),
+    axis.title    = element_text(size = 28, face = "bold", color = "grey20"),
+    axis.text     = element_text(size = 20, color = "grey20"),
+    axis.line     = element_line(color = "grey60", linewidth = 0.5),
+    axis.ticks    = element_line(color = "grey60"),
+    legend.position  = "top",
+    legend.title     = element_blank(),
+    legend.text      = element_text(size = 18, face = "bold"),
+    plot.margin      = margin(20, 25, 20, 20)
+  )
+
+print(fig6g)
+
+
+# ============================================================================
+# 9.  FIGURE 6H — Clearance-Hub Probability vs Pace (Bayesian)
+# ============================================================================
+# Bayesian mixed logistic regression with woman-level random intercepts.
+# Uses variational Bayes (meanfield) for computational tractability given
+# the sparse outcome (~24 clearance hubs across ~14 women).
+#
+# Model: clearance_hub ~ pace_z * PostPost + (1 | woman)
+
+cat("\n========================================\n")
+cat("  Figure 6H: Clearance-Hub Bayesian Model\n")
+cat("========================================\n")
+
+# --- Prepare modelling data ---
+lobule_clear <- lobule_clear %>%
+  left_join(
+    nn_data %>%
+      select(`Annotation ID`, Patient_ID, pace_index, meno.3group) %>%
+      distinct(),
+    by = "Annotation ID"
+  ) %>%
+  filter(!is.na(Patient_ID), !is.na(pace_index), !is.na(meno.3group)) %>%
+  mutate(
+    clearance_hub_int = as.integer(clearance_hub),
+    pace_z   = as.numeric(scale(pace_index)),
+    PostPost = as.integer(meno.3group == "Post-Post"),
+    woman    = Patient_ID
+  )
+
+cat("  Total lobules:", nrow(lobule_clear), "\n")
+cat("  Clearance hubs:", sum(lobule_clear$clearance_hub_int), "\n")
+cat("  Unique women:", n_distinct(lobule_clear$woman), "\n")
+
+# --- Fit Bayesian model (variational Bayes) ---
+priors <- c(
+  prior(normal(0, 2), class = "b"),
+  prior(normal(0, 2), class = "Intercept"),
+  prior(normal(0, 1), class = "sd", lb = 0)
+)
+
+set.seed(123)
+fit_bayes <- brm(
+  clearance_hub_int ~ pace_z * PostPost + (1 | woman),
+  data      = lobule_clear,
+  family    = bernoulli(link = "logit"),
+  prior     = priors,
+  algorithm = "meanfield",
+  iter      = 50000,
+  output_samples = 4000,
+  seed      = 123,
+  refresh   = 0
+)
+
+cat("\n")
+print(summary(fit_bayes))
+
+# --- Predictions for both trajectories ---
+pace_z_seq     <- seq(min(lobule_clear$pace_z), max(lobule_clear$pace_z),
+                      length.out = 100)
+pace_mean      <- mean(lobule_clear$pace_index, na.rm = TRUE)
+pace_sd        <- sd(lobule_clear$pace_index, na.rm = TRUE)
+pace_index_seq <- pace_z_seq * pace_sd + pace_mean
+
+pred_pre  <- posterior_epred(fit_bayes,
+  newdata = data.frame(pace_z = pace_z_seq, PostPost = 0, woman = NA),
+  re_formula = NA)
+pred_post <- posterior_epred(fit_bayes,
+  newdata = data.frame(pace_z = pace_z_seq, PostPost = 1, woman = NA),
+  re_formula = NA)
+
+pred_summary <- rbind(
+  data.frame(
+    pace_index = pace_index_seq, trajectory = "Pre-Menopause",
+    prob  = apply(pred_pre, 2, median),
+    lower = apply(pred_pre, 2, quantile, 0.025),
+    upper = apply(pred_pre, 2, quantile, 0.975)
+  ),
+  data.frame(
+    pace_index = pace_index_seq, trajectory = "Post-Menopause",
+    prob  = apply(pred_post, 2, median),
+    lower = apply(pred_post, 2, quantile, 0.025),
+    upper = apply(pred_post, 2, quantile, 0.975)
+  )
+) %>%
+  mutate(trajectory = factor(trajectory,
+                             levels = c("Pre-Menopause", "Post-Menopause")))
+
+# --- Per-woman observed clearance fraction ---
+woman_obs <- lobule_clear %>%
+  group_by(woman, meno.3group, PostPost, pace_index) %>%
+  summarise(frac_clear = mean(clearance_hub_int), n_lobules = n(),
+            .groups = "drop") %>%
+  mutate(trajectory = label_trajectory(meno.3group))
+
+# --- Plot ---
+bayes_colors <- c("Pre-Menopause" = "#E63946", "Post-Menopause" = "#457B9D")
+
+fig6h <- ggplot() +
+  geom_ribbon(data = pred_summary,
+              aes(x = pace_index, ymin = lower, ymax = upper,
+                  fill = trajectory),
+              alpha = 0.2) +
+  geom_line(data = pred_summary,
+            aes(x = pace_index, y = prob, color = trajectory),
+            linewidth = 1.5) +
+  geom_point(data = woman_obs,
+             aes(x = pace_index, y = frac_clear, color = trajectory),
+             size = 3.5, alpha = 0.7) +
+  scale_color_manual(values = bayes_colors) +
+  scale_fill_manual(values  = bayes_colors) +
+  scale_y_continuous(limits = c(0, 0.2), breaks = seq(0, 0.2, 0.05),
+                     labels = percent_format(accuracy = 1)) +
+  labs(
+    x        = "Involution Pace Index",
+    y        = "Predicted Clearance Hub Probability",
+    title    = "Clearance Hub Formation",
+    subtitle = "Bayesian mixed logistic regression",
+    color    = NULL, fill = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.border     = element_rect(color = "black", fill = NA, linewidth = 1),
+    plot.title    = element_text(size = 29, face = "bold", hjust = 0.5,
+                                  margin = margin(b = 8)),
+    plot.subtitle = element_text(size = 18, color = "grey30", hjust = 0.5,
+                                  margin = margin(b = 12)),
+    axis.title    = element_text(size = 28, face = "bold", color = "grey20"),
+    axis.text     = element_text(size = 20, color = "grey20"),
+    axis.line     = element_blank(),
+    axis.ticks    = element_line(color = "grey60"),
+    legend.position  = "top",
+    legend.title     = element_blank(),
+    legend.text      = element_text(size = 15, face = "bold"),
+    plot.margin      = margin(20, 25, 20, 20)
+  )
+
+print(fig6h)
+
+
+# ============================================================================
+# 10. FIGURE 6J & S6D — Forest Plot and Posterior Density
+# ============================================================================
+# Derived from the Bayesian model fit in Section 9.
+#
+# Fig 6J  — Forest plot of odds ratios (per +1 SD pace) for Pre→Post
+#           slope, Post→Post slope, and the interaction term.
+# Fig S6D — Posterior density of the pace × trajectory interaction
+#           coefficient on the log-odds scale.
+
+cat("\n========================================\n")
+cat("  Figures 6J & S6D: Forest Plot / Posterior\n")
+cat("========================================\n")
+
+# --- Extract posterior draws ---
+draws    <- as_draws_df(fit_bayes)
+b_pace   <- draws$b_pace_z
+b_int    <- draws$`b_pace_z:PostPost`
+b_pre    <- b_pace              # Pre→Post simple slope
+b_post   <- b_pace + b_int      # Post→Post simple slope
+
+# --- Helper: summarise draws into OR table row ---
+summ_row <- function(beta_draws, label) {
+  tibble(
+    term   = label,
+    or_med = median(exp(beta_draws)),
+    or_lo  = quantile(exp(beta_draws), 0.025),
+    or_hi  = quantile(exp(beta_draws), 0.975),
+    pr_gt0 = mean(beta_draws > 0)
+  )
+}
+
+forest_df <- bind_rows(
+  summ_row(b_post, "Post-Menopause Slope\n(OR per +1 SD pace)"),
+  summ_row(b_pre,  "Pre-Menopause Slope\n(OR per +1 SD pace)"),
+  summ_row(b_int,  "Interaction\n(OR ratio: Pre- vs Post-)")
+) %>%
+  mutate(term = factor(term, levels = rev(term)))
+
+# --- Fig 6J: Forest plot ---
+fig6j <- ggplot(forest_df, aes(y = term, x = or_med)) +
+  geom_vline(xintercept = 1, linetype = "dashed", linewidth = 1.3,
+             color = "red") +
+  geom_errorbarh(aes(xmin = or_lo, xmax = or_hi), height = 0.2,
+                 linewidth = 1.5, color = "grey10") +
+  geom_point(size = 4.5, color = "#2C7BE5") +
+  geom_text(
+    aes(x = or_hi * 1.35,
+        label = sprintf("OR = %.2f (%.2f\u2013%.2f)\nPr(>0) = %.3f",
+                        or_med, or_lo, or_hi, pr_gt0)),
+    hjust = 0, size = 6.3, color = "grey20", lineheight = 0.9
+  ) +
+  scale_x_log10(
+    breaks = c(0.25, 0.5, 1, 2, 4, 8),
+    labels = c("0.25", "0.5", "1", "2", "4", "8"),
+    expand = expansion(mult = c(0.05, 0.50))
+  ) +
+  coord_cartesian(
+    xlim = c(min(forest_df$or_lo) * 0.8, max(forest_df$or_hi) * 1.6),
+    clip = "off"
+  ) +
+  labs(x = "Odds Ratio (log scale)", y = NULL) +
+  theme_classic(base_size = 24) +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.border     = element_rect(color = "black", fill = NA, linewidth = 1),
+    axis.title.x     = element_text(size = 24, face = "bold", color = "black"),
+    axis.title.y     = element_blank(),
+    axis.text.x      = element_text(size = 24, color = "black"),
+    axis.text.y      = element_text(size = 24, face = "bold", color = "black",
+                                     hjust = 0.5),
+    axis.line        = element_blank(),
+    axis.ticks       = element_line(color = "grey60"),
+    plot.margin      = margin(10, 10, 10, 10)
+  )
+
+print(fig6j)
+
+# --- Fig S6D: Posterior density of interaction ---
+beta_int_draws <- draws$`b_pace_z:PostPost`
+pr_gt0  <- mean(beta_int_draws > 0)
+or_med  <- median(exp(beta_int_draws))
+or_ci   <- quantile(exp(beta_int_draws), probs = c(0.025, 0.975))
+
+fig_s6d <- ggplot(tibble(beta = beta_int_draws), aes(x = beta)) +
+  geom_density(fill = "#2C7BE5", alpha = 0.3, linewidth = 1.3,
+               color = "#1a4d7a") +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 1.1,
+             color = "grey40") +
+  geom_vline(xintercept = quantile(beta_int_draws, 0.025), linetype = "dotted",
+             linewidth = 0.99, color = "#E63946", alpha = 0.7) +
+  geom_vline(xintercept = quantile(beta_int_draws, 0.975), linetype = "dotted",
+             linewidth = 0.99, color = "#E63946", alpha = 0.7) +
+  annotate("text", x = 0, y = max(density(beta_int_draws)$y) * 0.5,
+           label = "Null\n(\u03B2 = 0)", vjust = 1, hjust = -0.1,
+           size = 5.5, color = "grey40", lineheight = 0.9) +
+  labs(
+    title = "Posterior Density: Pace \u00D7 Post\u2192Post Interaction",
+    subtitle = sprintf(
+      "Pr(\u03B2 > 0) = %.3f | OR ratio median = %.2f (95%% CI: %.2f\u2013%.2f)",
+      pr_gt0, or_med, or_ci[1], or_ci[2]
+    ),
+    x = "Interaction Coefficient (log-odds scale)",
+    y = "Posterior Density"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.border     = element_rect(color = "black", fill = NA, linewidth = 1),
+    plot.title    = element_text(size = 24, face = "bold", hjust = 0.5,
+                                  margin = margin(b = 8)),
+    plot.subtitle = element_text(size = 18, color = "grey30", hjust = 0.5,
+                                  margin = margin(b = 12)),
+    axis.title    = element_text(size = 20, face = "bold", color = "grey20"),
+    axis.text     = element_text(size = 22, color = "grey20"),
+    axis.line     = element_blank(),
+    axis.ticks    = element_line(color = "grey60"),
+    plot.margin   = margin(10, 10, 10, 10)
+  )
+
+print(fig_s6d)
+
+
+# ============================================================================
+# 11. FIGURE 6I — Mechanistic Integration: Stall-Hub vs Non-Stall
+# ============================================================================
+# Three comparisons testing whether stall-hub lobules differ from non-stall
+# lobules in proliferative and signaling architecture:
+#   (i)   Fraction of Ki67+ cells co-expressing pSTAT3+ (STAT3-coupled proliferation)
+#   (ii)  Median p16+ -> EREG+ distance (senescence-EREG spatial coupling)
+#   (iii) Fraction of Ki67+ epithelial cells (overall proliferative activity)
+#
+# All use Welch's t-test for visualization and woman-clustered OLS for inference.
+
+cat("\n========================================\n")
+cat("  Figure 6I: Mechanistic Integration\n")
+cat("========================================\n")
+
+# --- Per-lobule metrics (epithelial cells only) ---
+lobule_mechanics <- nn_data %>%
+  filter(`Tissue Category` == "Epithelial") %>%
+  group_by(`Annotation ID`, Patient_ID) %>%
+  summarise(
+    # (i) Fraction of Ki67+ cells that are also pSTAT3+
+    n_ki67         = sum(`Phenotype Ki67` == "Ki67+", na.rm = TRUE),
+    n_ki67_pstat3  = sum(`Phenotype Ki67` == "Ki67+" &
+                         `Phenotype pSTAT3` == "pSTAT3+", na.rm = TRUE),
+    frac_ki67_pstat3 = ifelse(n_ki67 >= 1, n_ki67_pstat3 / n_ki67, NA_real_),
+    # (ii) Median distance from p16+ cells to nearest EREG+
+    med_p16_to_ereg = median(
+      `Distance to EREG+`[`Phenotype p16` == "p16+"], na.rm = TRUE),
+    # (iii) Ki67+ fraction among all epithelial cells
+    n_epi          = n(),
+    frac_ki67_epi  = n_ki67 / n_epi,
+    .groups = "drop"
+  ) %>%
+  # Attach stall-hub status from Section 5 (lobule_dists)
+  left_join(lobule_dists %>% select(`Annotation ID`, hub_class),
+            by = "Annotation ID") %>%
+  mutate(stall_hub = hub_class == "Hub")
+
+# --- Shared boxplot theme ---
+theme_boxplot_6i <- theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.text.x  = element_text(size = 32, color = "black", face = "bold"),
+    axis.text.y  = element_text(size = 32, color = "black"),
+    axis.title.y = element_text(size = 32, face = "bold", margin = margin(r = 15)),
+    axis.title.x = element_blank(),
+    axis.line    = element_line(linewidth = 1),
+    axis.ticks   = element_line(linewidth = 1),
+    axis.ticks.length = unit(0.25, "cm"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    plot.title   = element_text(size = 25, face = "bold", hjust = 0.5),
+    plot.margin  = margin(10, 10, 10, 10)
+  )
+
+stall_colors <- c("TRUE" = "#E69F00", "FALSE" = "#0B3D91")
+
+# --- 6I (i): Ki67+ co-expressing pSTAT3+ ---
+tt_i <- t.test(frac_ki67_pstat3 ~ stall_hub,
+               data = lobule_mechanics %>% filter(!is.na(frac_ki67_pstat3)))
+
+fig6i_i <- ggplot(
+  lobule_mechanics %>% filter(!is.na(frac_ki67_pstat3)),
+  aes(x = factor(stall_hub, levels = c(TRUE, FALSE),
+                  labels = c("Stall", "Non-Stall")),
+      y = frac_ki67_pstat3,
+      color = factor(stall_hub))
+) +
+  geom_boxplot(outlier.shape = NA, linewidth = 1.2, fill = NA) +
+  geom_jitter(width = 0.15, size = 4, alpha = 0.6) +
+  scale_color_manual(values = stall_colors) +
+  annotate("text", x = 1.5,
+           y = max(lobule_mechanics$frac_ki67_pstat3, na.rm = TRUE) * 1.05,
+           label = paste0("p = ", format.pval(tt_i$p.value, digits = 2)),
+           size = 9, fontface = "bold") +
+  labs(y = "Ki67+ cells that are pSTAT3+ (fraction)",
+       title = "Ki67+ cells co-expressing pSTAT3+") +
+  theme_boxplot_6i
+
+print(fig6i_i)
+
+# --- 6I (ii): p16+ -> EREG+ distance ---
+tt_ii <- t.test(log1p(med_p16_to_ereg) ~ stall_hub,
+                data = lobule_mechanics %>% filter(!is.na(med_p16_to_ereg)))
+
+fig6i_ii <- ggplot(
+  lobule_mechanics %>% filter(!is.na(med_p16_to_ereg)),
+  aes(x = factor(stall_hub, levels = c(TRUE, FALSE),
+                  labels = c("Stall", "Non-Stall")),
+      y = log1p(med_p16_to_ereg),
+      color = factor(stall_hub))
+) +
+  geom_boxplot(outlier.shape = NA, linewidth = 1.2, fill = NA) +
+  geom_jitter(width = 0.15, size = 4, alpha = 0.6) +
+  scale_color_manual(values = stall_colors) +
+  annotate("text", x = 1.5,
+           y = max(log1p(lobule_mechanics$med_p16_to_ereg), na.rm = TRUE) * 1.05,
+           label = paste0("p = ", format.pval(tt_ii$p.value, digits = 2)),
+           size = 9, fontface = "bold") +
+  labs(y = "log(1 + p16 to EREG distance)",
+       title = "Median Distance: p16+ -> EREG+") +
+  theme_boxplot_6i
+
+print(fig6i_ii)
+
+# --- 6I (iii): Ki67+ epithelial fraction ---
+tt_iii <- t.test(frac_ki67_epi ~ stall_hub,
+                 data = lobule_mechanics %>% filter(!is.na(frac_ki67_epi)))
+
+fig6i_iii <- ggplot(
+  lobule_mechanics %>% filter(!is.na(frac_ki67_epi)),
+  aes(x = factor(stall_hub, levels = c(TRUE, FALSE),
+                  labels = c("Stall", "Non-Stall")),
+      y = frac_ki67_epi,
+      color = factor(stall_hub))
+) +
+  geom_boxplot(outlier.shape = NA, linewidth = 1.2, fill = NA) +
+  geom_jitter(width = 0.15, size = 4, alpha = 0.6) +
+  scale_color_manual(values = stall_colors) +
+  annotate("text", x = 1.5,
+           y = max(lobule_mechanics$frac_ki67_epi, na.rm = TRUE) * 1.05,
+           label = paste0("p = ", format.pval(tt_iii$p.value, digits = 2)),
+           size = 9, fontface = "bold") +
+  labs(y = "Fraction of Ki67+ epithelial cells", title = "") +
+  theme_boxplot_6i
+
+print(fig6i_iii)
+
+# --- Woman-clustered inference for all three ---
+cat("\n  Woman-clustered OLS results:\n")
+
+glm_i  <- lm(frac_ki67_pstat3 ~ stall_hub, data = lobule_mechanics)
+cat("  (i) Ki67+/pSTAT3+:\n")
+print(coeftest(glm_i, vcov = vcovCL(glm_i, cluster = ~Patient_ID)))
+
+glm_ii <- lm(log1p(med_p16_to_ereg) ~ stall_hub, data = lobule_mechanics)
+cat("  (ii) p16->EREG distance:\n")
+print(coeftest(glm_ii, vcov = vcovCL(glm_ii, cluster = ~Patient_ID)))
+
+glm_iii <- lm(frac_ki67_epi ~ stall_hub, data = lobule_mechanics)
+cat("  (iii) Ki67 epi fraction:\n")
+print(coeftest(glm_iii, vcov = vcovCL(glm_iii, cluster = ~Patient_ID)))
+
+
+# ============================================================================
+# 12. FIGURE 6K — DBSCAN Spatial Validation (Stall vs Clearance Hubs)
+# ============================================================================
+# Validates that stall-hubs and clearance-hubs have distinct spatial
+# architecture using DBSCAN-based clustering metrics:
+#   - pSTAT3+ clustering fraction: higher in stall-hubs (convergent signaling)
+#   - p16-CD16 mixed cluster engagement: higher in clearance-hubs (immune contact)
+#
+# Two boxplots at the primary eps=12 um, plus two eps sensitivity plots
+# across eps = {6, 8, 10, 12, 14} um showing robustness.
+
+cat("\n========================================\n")
+cat("  Figure 6K: DBSCAN Validation\n")
+cat("========================================\n")
+
+# --- Merge stall + clearance labels per lobule ---
+# (lobule_dists from Section 5, lobule_clear from Section 8)
+lobule_hub_types <- lobule_dists %>%
+  select(`Annotation ID`, hub_class) %>%
+  mutate(stall_hub = hub_class == "Hub") %>%
+  left_join(
+    lobule_clear %>% select(`Annotation ID`, clearance_hub),
+    by = "Annotation ID"
+  ) %>%
+  mutate(
+    hub_type = case_when(
+      stall_hub & !clearance_hub ~ "Stall",
+      clearance_hub & !stall_hub ~ "Clearance",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(hub_type)) %>%
+  select(`Annotation ID`, hub_type)
+
+cat("  Stall:", sum(lobule_hub_types$hub_type == "Stall"),
+    "| Clearance:", sum(lobule_hub_types$hub_type == "Clearance"), "\n")
+
+# --- DBSCAN metric functions ---
+
+#' Fraction of epithelial pSTAT3+ cells that fall within DBSCAN clusters.
+#' Higher values indicate spatially concentrated pSTAT3+ signaling.
+dbscan_pstat3_frac <- function(df, eps_val, minPts = 5) {
+  pstat3_cells <- df %>%
+    filter(`Tissue Category` == "Epithelial", `Phenotype pSTAT3` == "pSTAT3+")
+  if (nrow(pstat3_cells) < minPts) return(NA_real_)
+  coords <- pstat3_cells %>%
+    select(`Cell X Position`, `Cell Y Position`) %>% as.matrix()
+  cl <- dbscan(coords, eps = eps_val, minPts = minPts)
+  mean(cl$cluster > 0)
+}
+
+#' Fraction of epithelial p16+ cells in mixed p16-CD16 clusters.
+#' Higher values indicate active immune-senescent cell contact.
+dbscan_p16_cd16_engage <- function(df, eps_val, minPts = 5) {
+  p16_cells <- df %>%
+    filter(`Tissue Category` == "Epithelial", `Phenotype p16` == "p16+") %>%
+    mutate(cell_type = "p16")
+  cd16_cells <- df %>%
+    filter(`Phenotype CD16` == "CD16+") %>%
+    mutate(cell_type = "CD16")
+  if (nrow(p16_cells) == 0) return(NA_real_)
+  pooled <- bind_rows(p16_cells, cd16_cells)
+  if (nrow(pooled) < minPts) return(0)
+  coords <- pooled %>%
+    select(`Cell X Position`, `Cell Y Position`) %>% as.matrix()
+  cl <- dbscan(coords, eps = eps_val, minPts = minPts)
+  pooled$cluster <- cl$cluster
+  # Identify clusters containing both cell types
+  mixed_clusters <- pooled %>%
+    filter(cluster > 0) %>%
+    group_by(cluster) %>%
+    summarise(has_p16 = any(cell_type == "p16"),
+              has_cd16 = any(cell_type == "CD16"), .groups = "drop") %>%
+    filter(has_p16 & has_cd16) %>%
+    pull(cluster)
+  p16_in_pooled <- pooled %>% filter(cell_type == "p16")
+  mean(p16_in_pooled$cluster %in% mixed_clusters)
+}
+
+# --- Compute metrics across eps grid ---
+eps_vals <- c(6, 8, 10, 12, 14)
+
+cat("  Computing DBSCAN metrics (this may take a moment)...\n")
+dbscan_metrics <- nn_data %>%
+  group_by(`Annotation ID`) %>%
+  group_modify(~ {
+    df <- .x
+    tibble(
+      eps = eps_vals,
+      pstat3_cluster_frac  = sapply(eps_vals, function(e)
+        dbscan_pstat3_frac(df, e, minPts = 5)),
+      p16_cd16_engage_frac = sapply(eps_vals, function(e)
+        dbscan_p16_cd16_engage(df, e, minPts = 5))
+    )
+  }) %>%
+  ungroup() %>%
+  inner_join(lobule_hub_types, by = "Annotation ID") %>%
+  left_join(nn_data %>% select(`Annotation ID`, Patient_ID) %>% distinct(),
+            by = "Annotation ID")
+
+# --- Boxplots at primary eps=12 ---
+db_main <- dbscan_metrics %>%
+  filter(eps == 12) %>%
+  mutate(hub_type = factor(hub_type, levels = c("Clearance", "Stall")))
+
+dbscan_hub_colors <- c("Stall" = "darkblue", "Clearance" = "orange")
+
+# Woman-clustered inference at eps=12
+m1 <- lm(pstat3_cluster_frac ~ hub_type, data = db_main)
+res1 <- coeftest(m1, vcov = vcovCL(m1, cluster = ~Patient_ID))
+beta_pstat3  <- res1["hub_typeStall", "Estimate"]
+p_pstat3     <- res1["hub_typeStall", "Pr(>|t|)"]
+
+m2 <- lm(p16_cd16_engage_frac ~ hub_type, data = db_main)
+res2 <- coeftest(m2, vcov = vcovCL(m2, cluster = ~Patient_ID))
+beta_p16cd16 <- res2["hub_typeStall", "Estimate"]
+p_p16cd16    <- res2["hub_typeStall", "Pr(>|t|)"]
+
+cat(sprintf("  pSTAT3 clustering: beta = %.3f, p = %.4f\n", beta_pstat3, p_pstat3))
+cat(sprintf("  p16-CD16 engagement: beta = %.3f, p = %.4f\n", beta_p16cd16, p_p16cd16))
+
+# Shared DBSCAN boxplot theme
+theme_dbscan_box <- theme_classic(base_size = 16) +
+  theme(
+    legend.position = "none",
+    plot.title   = element_text(face = "bold", hjust = 0.5),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+    plot.margin  = margin(10, 10, 10, 10)
+  )
+
+fig6k_pstat3_box <- ggplot(db_main, aes(x = hub_type, y = pstat3_cluster_frac)) +
+  geom_boxplot(color = "black", outlier.shape = NA, fill = NA) +
+  geom_jitter(aes(color = hub_type), width = 0.2, size = 1.9, alpha = 0.6) +
+  stat_summary(fun = median, geom = "crossbar", width = 0.6, color = "orange",
+               linewidth = 0.7) +
+  scale_color_manual(values = dbscan_hub_colors) +
+  annotate("text", x = 1.5,
+           y = max(db_main$pstat3_cluster_frac, na.rm = TRUE) * 1.05,
+           label = sprintf("beta = %.3f, p = %.4f", beta_pstat3, p_pstat3),
+           size = 3.5, hjust = 0.5) +
+  labs(title = "Stall hubs: Increased pSTAT3 clustering",
+       x = "", y = "Fraction of pSTAT3+ cells in clusters") +
+  theme_dbscan_box
+
+fig6k_p16cd16_box <- ggplot(db_main, aes(x = hub_type, y = p16_cd16_engage_frac)) +
+  geom_boxplot(color = "black", outlier.shape = NA, fill = NA) +
+  geom_jitter(aes(color = hub_type), width = 0.2, size = 1.9, alpha = 0.6) +
+  stat_summary(fun = median, geom = "crossbar", width = 0.6, color = "orange",
+               linewidth = 0.7) +
+  scale_color_manual(values = dbscan_hub_colors) +
+  annotate("text", x = 1.5,
+           y = max(db_main$p16_cd16_engage_frac, na.rm = TRUE) * 1.05,
+           label = sprintf("beta = %.3f, p = %.4f", beta_p16cd16, p_p16cd16),
+           size = 4.5, hjust = 0.5) +
+  labs(title = "Clearance hubs: Increased p16-CD16 engagement",
+       x = "", y = "Fraction of p16+ cells in mixed clusters") +
+  theme_dbscan_box
+
+print(fig6k_pstat3_box)
+print(fig6k_p16cd16_box)
+
+# --- Eps sensitivity with woman-clustered inference ---
+eps_beta <- dbscan_metrics %>%
+  group_by(eps) %>%
+  group_modify(~ {
+    df <- .x %>% mutate(hub_type = factor(hub_type,
+                                           levels = c("Clearance", "Stall")))
+    m1 <- lm(pstat3_cluster_frac ~ hub_type, data = df)
+    c1 <- coeftest(m1, vcov = vcovCL(m1, cluster = ~Patient_ID))
+    m2 <- lm(p16_cd16_engage_frac ~ hub_type, data = df)
+    c2 <- coeftest(m2, vcov = vcovCL(m2, cluster = ~Patient_ID))
+    tibble(
+      beta_pstat3     = c1["hub_typeStall", "Estimate"],
+      se_pstat3       = c1["hub_typeStall", "Std. Error"],
+      ci_low_pstat3   = c1["hub_typeStall", "Estimate"] - 1.96 * c1["hub_typeStall", "Std. Error"],
+      ci_high_pstat3  = c1["hub_typeStall", "Estimate"] + 1.96 * c1["hub_typeStall", "Std. Error"],
+      beta_p16cd16    = c2["hub_typeStall", "Estimate"],
+      se_p16cd16      = c2["hub_typeStall", "Std. Error"],
+      ci_low_p16cd16  = c2["hub_typeStall", "Estimate"] - 1.96 * c2["hub_typeStall", "Std. Error"],
+      ci_high_p16cd16 = c2["hub_typeStall", "Estimate"] + 1.96 * c2["hub_typeStall", "Std. Error"]
+    )
+  }) %>%
+  ungroup()
+
+# Shared eps sensitivity theme
+theme_eps <- theme_classic(base_size = 18) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+fig6k_pstat3_eps <- ggplot(eps_beta, aes(x = eps, y = beta_pstat3)) +
+  geom_ribbon(aes(ymin = ci_low_pstat3, ymax = ci_high_pstat3),
+              alpha = 0.2, fill = "lightblue") +
+  geom_line(color = "#377EB8", linewidth = 1.2) +
+  geom_point(color = "#377EB8", size = 2) +
+  geom_point(data = eps_beta %>% filter(eps == 12),
+             color = "black", size = 5, shape = 21, fill = "#FFD700", stroke = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(title = "pSTAT3 eps sensitivity",
+       x = "eps (um)", y = "beta (Stall - Clearance)") +
+  theme_eps
+
+fig6k_p16cd16_eps <- ggplot(eps_beta, aes(x = eps, y = beta_p16cd16)) +
+  geom_ribbon(aes(ymin = ci_low_p16cd16, ymax = ci_high_p16cd16),
+              alpha = 0.2, fill = "lightblue") +
+  geom_line(color = "#377EB8", linewidth = 1.2) +
+  geom_point(color = "#377EB8", size = 2) +
+  geom_point(data = eps_beta %>% filter(eps == 12),
+             color = "black", size = 5, shape = 21, fill = "#FFD700", stroke = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(title = "p16-CD16 eps sensitivity",
+       x = "eps (um)", y = "beta (Stall - Clearance)") +
+  theme_eps
+
+print(fig6k_pstat3_eps)
+print(fig6k_p16cd16_eps)
+
+
+# ============================================================================
+# 13. FIGURE S6A — Stall-Hub Forest Plot (OR per +1 SD Pace)
+# ============================================================================
+# Lobule-level logistic regression: stall_hub ~ pace_z, with woman-clustered
+# robust SEs. Reports the odds ratio per +1 SD increase in involution pace.
+
+cat("\n========================================\n")
+cat("  Figure S6A: Stall-Hub Forest Plot\n")
+cat("========================================\n")
+
+# --- Prepare lobule-level data with pace z-score ---
+lobule_pace <- nn_data %>%
+  select(`Annotation ID`, Patient_ID) %>%
+  distinct() %>%
+  left_join(lobule_dists %>% select(`Annotation ID`, hub_class),
+            by = "Annotation ID") %>%
+  mutate(stall_hub = as.numeric(hub_class == "Hub")) %>%
+  left_join(
+    pace_meta %>% mutate(pace_z = as.numeric(scale(pace_index))),
+    by = "Patient_ID"
+  ) %>%
+  filter(!is.na(pace_z))
+
+# --- Logistic regression with woman-clustered SEs ---
+fit_s6a  <- glm(stall_hub ~ pace_z, family = binomial(), data = lobule_pace)
+vcov_s6a <- vcovCL(fit_s6a, cluster = ~Patient_ID)
+ct_s6a   <- coeftest(fit_s6a, vcov = vcov_s6a)
+
+est_s6a <- ct_s6a["pace_z", "Estimate"]
+se_s6a  <- ct_s6a["pace_z", "Std. Error"]
+p_s6a   <- ct_s6a["pace_z", "Pr(>|z|)"]
+
+result_s6a <- tibble(
+  label   = "Stall Hub",
+  OR      = exp(est_s6a),
+  CI_low  = exp(est_s6a - 1.96 * se_s6a),
+  CI_high = exp(est_s6a + 1.96 * se_s6a),
+  p_value = p_s6a
+)
+
+cat(sprintf("  OR = %.2f (%.2f-%.2f), p = %.4f\n",
+            result_s6a$OR, result_s6a$CI_low, result_s6a$CI_high, result_s6a$p_value))
+
+# --- Forest plot ---
+fig_s6a <- ggplot(result_s6a, aes(x = OR, y = label)) +
+  geom_pointrange(aes(xmin = CI_low, xmax = CI_high),
+                  size = 1.2, fatten = 5, color = "#E74C3C") +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "#E74C3C",
+             linewidth = 0.9) +
+  annotate("text",
+           x = result_s6a$CI_high * 1.1, y = 1,
+           label = sprintf("OR = %.2f [%.2f, %.2f] p = %.4f",
+                           result_s6a$OR, result_s6a$CI_low,
+                           result_s6a$CI_high, result_s6a$p_value),
+           hjust = 0, vjust = 1, size = 4, lineheight = 1.1,
+           fontface = "bold") +
+  labs(
+    title    = "Lobule-Level Association: Stall Hub and Involution Pace",
+    subtitle = "Logistic regression with woman-clustered standard errors",
+    x        = "Odds Ratio (per +1 SD faster pace)",
+    y        = "",
+    caption  = "Stall hub = lobules with both p16+ and CD16+ cells proximal to pSTAT3+ (bottom 20%)"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 24, hjust = 0.5,
+                                  margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 16, hjust = 0.5,
+                                  margin = margin(b = 15)),
+    plot.caption  = element_text(size = 14, hjust = 0, face = "italic",
+                                  margin = margin(t = 10)),
+    axis.title.x  = element_text(face = "bold", size = 22,
+                                  margin = margin(t = 10)),
+    axis.title.y  = element_blank(),
+    axis.text.x   = element_text(size = 18),
+    axis.text.y   = element_text(size = 20, face = "bold"),
+    axis.line     = element_line(color = accent_color, linewidth = 0.6),
+    panel.border  = element_rect(color = accent_color, fill = NA, linewidth = 0.8),
+    panel.grid.major = element_line(color = grid_color, linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    plot.margin      = margin(20, 20, 20, 20)
+  )
+
+print(fig_s6a)
+
+
+# ============================================================================
+# 14. FIGURE S6C — Epithelial pSTAT3+ Fractions vs Pace
+# ============================================================================
+# Per-woman mean and maximum epithelial pSTAT3+ fractions vs involution pace.
+# Tests whether pSTAT3 activation scales with pace at the woman level.
+
+cat("\n========================================\n")
+cat("  Figure S6C: pSTAT3+ Fractions vs Pace\n")
+cat("========================================\n")
+
+# --- Per-lobule epithelial pSTAT3+ fraction ---
+lobule_pstat3_frac <- nn_data %>%
+  filter(`Tissue Category` == "Epithelial") %>%
+  group_by(`Annotation ID`) %>%
+  summarise(
+    pstat3_frac = mean(`Phenotype pSTAT3` == "pSTAT3+", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    nn_data %>% select(`Annotation ID`, Patient_ID, pace_index) %>% distinct(),
+    by = "Annotation ID"
+  ) %>%
+  filter(!is.na(Patient_ID), !is.na(pace_index))
+
+# --- Per-woman mean and max ---
+woman_pstat3 <- lobule_pstat3_frac %>%
+  group_by(Patient_ID) %>%
+  summarise(
+    mean_frac  = mean(pstat3_frac, na.rm = TRUE),
+    max_frac   = max(pstat3_frac, na.rm = TRUE),
+    pace_index = first(pace_index),
+    n_lobules  = n(),
+    .groups = "drop"
+  ) %>%
+  filter(is.finite(mean_frac) & is.finite(max_frac))
+
+# --- Correlation tests ---
+cor_mean <- cor.test(woman_pstat3$pace_index, woman_pstat3$mean_frac,
+                     method = "pearson")
+cor_max  <- cor.test(woman_pstat3$pace_index, woman_pstat3$max_frac,
+                     method = "pearson")
+
+cat(sprintf("  Mean pSTAT3: r = %.3f, p = %.4f\n",
+            cor_mean$estimate, cor_mean$p.value))
+cat(sprintf("  Max pSTAT3:  r = %.3f, p = %.4f\n",
+            cor_max$estimate, cor_max$p.value))
+
+# --- Plot ---
+fig_s6c <- ggplot(woman_pstat3, aes(x = pace_index)) +
+  # Mean fraction (orange)
+  geom_point(aes(y = mean_frac), color = "#FF8C00", alpha = 0.7,
+             shape = 16, size = 3) +
+  geom_smooth(aes(y = mean_frac), method = "lm", color = "#FF8C00",
+              fill = "#FF8C00", alpha = 0.2, linewidth = 1.5) +
+  # Max fraction (red)
+  geom_point(aes(y = max_frac), color = "#DC143C", alpha = 0.7,
+             shape = 17, size = 3) +
+  geom_smooth(aes(y = max_frac), method = "lm", color = "#DC143C",
+              fill = "#DC143C", alpha = 0.2, linewidth = 1.5) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  # Manual legend via annotations
+  annotate("point", x = max(woman_pstat3$pace_index) * 0.98,
+           y = max(woman_pstat3$max_frac) * 0.95,
+           color = "#FF8C00", size = 4, shape = 16) +
+  annotate("text", x = max(woman_pstat3$pace_index) * 0.96,
+           y = max(woman_pstat3$max_frac) * 0.95,
+           label = "Mean", hjust = 1, size = 4, fontface = "bold",
+           color = "#FF8C00") +
+  annotate("point", x = max(woman_pstat3$pace_index) * 0.98,
+           y = max(woman_pstat3$max_frac) * 0.88,
+           color = "#DC143C", size = 4, shape = 17) +
+  annotate("text", x = max(woman_pstat3$pace_index) * 0.96,
+           y = max(woman_pstat3$max_frac) * 0.88,
+           label = "Max", hjust = 1, size = 4, fontface = "bold",
+           color = "#DC143C") +
+  labs(
+    x        = "Involution Pace Index",
+    y        = "Epithelial pSTAT3+ Fraction",
+    title    = "pSTAT3 Activation Correlates with Involution Pace",
+    subtitle = sprintf(
+      "Mean: r = %.3f, p = %.4f | Max: r = %.3f, p = %.4f",
+      cor_mean$estimate, cor_mean$p.value,
+      cor_max$estimate, cor_max$p.value
+    ),
+    caption  = "Orange circles = mean fraction per woman; Red triangles = max fraction per woman"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    plot.title    = element_text(size = 24, face = "bold", hjust = 0.5,
+                                  margin = margin(b = 8)),
+    plot.subtitle = element_text(size = 18, color = "grey30", hjust = 0.5,
+                                  margin = margin(b = 15)),
+    plot.caption  = element_text(size = 10, color = "grey40", hjust = 0,
+                                  margin = margin(t = 10)),
+    axis.title    = element_text(size = 22, face = "bold", color = "grey20"),
+    axis.text     = element_text(size = 16, color = "grey20"),
+    axis.line     = element_line(color = "grey60", linewidth = 0.5),
+    axis.ticks    = element_line(color = "grey60"),
+    legend.position = "top",
+    legend.title    = element_text(size = 16, face = "bold"),
+    legend.text     = element_text(size = 16),
+    plot.margin     = margin(20, 25, 20, 20)
+  )
+
+print(fig_s6c)
+
+
+# ============================================================================
+# 15. SESSION COMPLETE
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Figure 6 Complete\n")
+cat("========================================\n")
+cat("  Figures: 6C, 6D, 6G, 6H, 6I (i-iii), 6J, 6K (4 panels),\n")
+cat("           S6A, S6B, S6C, S6D\n")
