@@ -1,0 +1,1500 @@
+# ============================================================================
+# Figure 4 — Figures 4A-K
+# Transcriptomic Signatures of Involution Pace Across Menopausal Strata
+# ============================================================================
+#
+# Description:
+#   Integrates bulk transcriptomic data (GSEA hallmark enrichment and
+#   NanoString gene expression) to characterize molecular programs that
+#   distinguish fast vs slow involution, and how these differ across
+#   menopausal strata.
+#
+# Figures produced:
+#   Fig 4A  — Hallmark pathway NES scatter: Pre->Post (x) vs Post->Post (y)
+#             enrichment, highlighting sign-flip pathways.
+#   Fig 4B  — Selected inflammatory/signaling hallmarks grouped bar chart
+#             comparing NES across menopausal strata.
+#   Fig 4C  — Gene expression log2FC heatmap (Fast vs Stagnant) across
+#             All, Pre-M, and Post-M strata for 24 genes.
+#   Fig 4D  — Pre-menopausal scatter: SASP score (z) vs Pace (z).
+#   Fig 4E  — Post-menopausal scatter: SASP score (z) vs Pace (z).
+#   Fig 4F  — SASP score x menopause proximity interaction: conditional
+#             slope of SASP effect across years to menopause.
+#   Fig 4G  — Trajectory-stratified forest plot: SASP effect sizes with
+#             global interaction p-value.
+#   Fig 4H  — Pre-menopausal scatter: Hub score (z) vs Pace (z).
+#   Fig 4I  — Post-menopausal scatter: Hub score (z) vs Pace (z).
+#   Fig 4J  — Hub score x menopause proximity interaction plot.
+#   Fig 4K  — Trajectory-stratified forest plot: Hub effect sizes.
+#
+# Inputs (place in DATA_DIR):
+#   Dataset A (GSEA, for 4A-B):
+#     - gsea_prepost_neg.tsv           GSEA negative enrichment, Pre->Post
+#     - gsea_prepost_pos.tsv           GSEA positive enrichment, Pre->Post
+#     - gsea_postpost_neg.tsv          GSEA negative enrichment, Post->Post
+#     - gsea_postpost_pos.tsv          GSEA positive enrichment, Post->Post
+#   Dataset B (NanoString, for 4C-K):
+#     - MBC_Nanostring.xlsx            NanoString clinical expression data
+#
+# Dependencies:
+#   dplyr, tidyr, readr, readxl, ggplot2, ggrepel, scales, forcats
+# ============================================================================
+
+
+# ============================================================================
+# 0.  SETUP
+# ============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(readxl)
+  library(ggplot2)
+  library(ggrepel)
+  library(scales)
+  library(forcats)
+})
+
+
+# ============================================================================
+# 1.  FILE PATHS & CONSTANTS
+# ============================================================================
+
+DATA_DIR <- "data"
+
+# --- Dataset A: GSEA enrichment tables (4A-B) ---
+gsea_prepost_neg_path  <- file.path(DATA_DIR, "gsea_prepost_neg.tsv")
+gsea_prepost_pos_path  <- file.path(DATA_DIR, "gsea_prepost_pos.tsv")
+gsea_postpost_neg_path <- file.path(DATA_DIR, "gsea_postpost_neg.tsv")
+gsea_postpost_pos_path <- file.path(DATA_DIR, "gsea_postpost_pos.tsv")
+
+# --- Dataset B: NanoString clinical data (4C-K) ---
+nanostring_path <- file.path(DATA_DIR, "MBC_Nanostring.xlsx")
+
+
+# ============================================================================
+# 2.  SHARED AESTHETICS
+# ============================================================================
+
+text_color   <- "black"
+grid_color   <- "#E8E8E8"
+accent_color <- "#34495E"
+pre_color    <- "#D17A29"
+post_color   <- "#2E7D9E"
+
+
+# ============================================================================
+# 3.  LOAD DATASET A — GSEA Hallmark Enrichment (for 4A-B)
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Loading GSEA Data (4A-B)\n")
+cat("========================================\n")
+
+# Pre->Post stratum: combine positive and negative enrichment tables
+prepost_all <- bind_rows(
+  read_tsv(gsea_prepost_pos_path, show_col_types = FALSE),
+  read_tsv(gsea_prepost_neg_path, show_col_types = FALSE)
+) %>%
+  select(NAME, NES, `FDR q-val`) %>%
+  rename(NES_prepost = NES, FDR_prepost = `FDR q-val`)
+
+# Post->Post stratum
+postpost_all <- bind_rows(
+  read_tsv(gsea_postpost_pos_path, show_col_types = FALSE),
+  read_tsv(gsea_postpost_neg_path, show_col_types = FALSE)
+) %>%
+  select(NAME, NES, `FDR q-val`) %>%
+  rename(NES_postpost = NES, FDR_postpost = `FDR q-val`)
+
+# Join by pathway name
+hallmark_nes <- prepost_all %>%
+  inner_join(postpost_all, by = "NAME") %>%
+  mutate(
+    sign_flip = (NES_prepost * NES_postpost < 0),
+    shape     = ifelse(sign_flip, "Sign flip", "No sign flip")
+  )
+
+cat("  Hallmark pathways:", nrow(hallmark_nes), "\n")
+cat("  Sign flips:", sum(hallmark_nes$sign_flip), "\n")
+
+
+# ============================================================================
+# 4.  LOAD DATASET B — NanoString Clinical Data (for 4C-K)
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Loading NanoString Data (4C-K)\n")
+cat("========================================\n")
+
+mbc_data <- read_excel(nanostring_path)
+names(mbc_data) <- make.names(names(mbc_data), unique = TRUE)
+
+# Ensure key columns are numeric
+mbc_data <- mbc_data %>%
+  mutate(
+    pace_index          = as.numeric(pace_regpos),
+    years_to_meno_init  = as.numeric(years_to_meno_init),
+    years.between.biop  = as.numeric(years.between.biop),
+    init.med.lob.area2  = as.numeric(init.med.lob.area2),
+    init.med.lob.acini2 = as.numeric(init.med.lob.acini2)
+  )
+
+cat("  Samples:", nrow(mbc_data), "\n")
+
+
+# ============================================================================
+# 5.  FIGURE 4A — Hallmark NES Scatter (Pre->Post vs Post->Post)
+# ============================================================================
+# Each point is one MSigDB Hallmark pathway. X-axis = NES from the Pre->Post
+# stratum (fast vs slow pace among women who transition through menopause).
+# Y-axis = NES from the Post->Post stratum (fast vs slow among already-post
+# menopausal women). Sign-flip pathways (opposite direction across strata)
+# are highlighted in red.
+
+cat("\n========================================\n")
+cat("  Figure 4A: Hallmark NES Scatter\n")
+cat("========================================\n")
+
+# Pathways to label (manually curated for biological relevance)
+label_sets <- c(
+  "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+  "HALLMARK_INFLAMMATORY_RESPONSE",
+  "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+  "HALLMARK_ESTROGEN_RESPONSE_EARLY",
+  "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+  "HALLMARK_G2M_CHECKPOINT"
+)
+
+hallmark_nes <- hallmark_nes %>%
+  mutate(
+    label = ifelse(NAME %in% label_sets,
+                   gsub("_", " ", gsub("HALLMARK_", "", NAME)),
+                   NA)
+  )
+
+fig4a <- ggplot(hallmark_nes,
+  aes(x = NES_prepost, y = NES_postpost, shape = shape, color = shape)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = accent_color,
+             linewidth = 0.8, alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = accent_color,
+             linewidth = 0.8, alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "black",
+              linewidth = 0.6) +
+  geom_point(size = 7, stroke = 1.2, alpha = 0.85) +
+  geom_text_repel(
+    aes(label = label, fontface = ifelse(sign_flip, "bold", "plain")),
+    size = 10.5, box.padding = 1.5, point.padding = 2.2,
+    max.overlaps = Inf, min.segment.length = 0.1,
+    segment.size = 0.5, segment.color = "grey10",
+    force = 5, force_pull = 0.5
+  ) +
+  scale_shape_manual(values = c("No sign flip" = 16, "Sign flip" = 16), name = "") +
+  scale_color_manual(values = c("No sign flip" = "#E67E22", "Sign flip" = "#E74C3C"),
+                     name = "") +
+  coord_cartesian(xlim = c(-2.5, 2.5), ylim = c(-2.5, 2.5), expand = TRUE) +
+  labs(
+    title = "Hallmark Pathway Enrichment Across Menopausal Strata",
+    x = "<- Pre-menopausal Enrichment | Post-menopausal Enrichment ->",
+    y = "Pathway Activity Within Post-menopause (NES)\n<- Slow enrichment | Fast enrichment ->"
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    plot.title    = element_text(size = 34, face = "bold", hjust = 0.5,
+                                  margin = margin(b = 20)),
+    axis.title.x  = element_text(size = 30, face = "bold",
+                                  margin = margin(t = 15), lineheight = 1.2),
+    axis.title.y  = element_text(size = 30, face = "bold",
+                                  margin = margin(r = 15), lineheight = 1.2),
+    axis.text     = element_text(size = 20),
+    axis.line     = element_line(color = accent_color, linewidth = 0.6),
+    panel.border  = element_rect(color = accent_color, fill = NA, linewidth = 0.9),
+    panel.grid.major = element_line(color = grid_color, linewidth = 0.5),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.position    = "top",
+    legend.direction   = "horizontal",
+    legend.title       = element_blank(),
+    legend.text        = element_text(size = 24, face = "bold"),
+    legend.key.size    = unit(1.2, "cm"),
+    plot.margin        = margin(20, 20, 20, 20)
+  )
+
+print(fig4a)
+
+
+# ============================================================================
+# 6.  FIGURE 4B — Selected Hallmarks Grouped Bar Chart
+# ============================================================================
+# Subset of inflammatory/signaling pathways shown as side-by-side bars
+# for Pre-menopause and Post-menopause NES. Pathways with sign flips
+# (opposite enrichment direction across strata) are outlined in red.
+
+cat("\n========================================\n")
+cat("  Figure 4B: Selected Hallmarks Bars\n")
+cat("========================================\n")
+
+selected_pathways <- c(
+  "HALLMARK_HYPOXIA",
+  "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+  "HALLMARK_COMPLEMENT",
+  "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+  "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+  "HALLMARK_INFLAMMATORY_RESPONSE",
+  "HALLMARK_IL6_JAK_STAT3_SIGNALING"
+)
+
+display_names <- c(
+  "HALLMARK_HYPOXIA"                          = "Hypoxia",
+  "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION" = "Epithelial-Mesenchymal Transition",
+  "HALLMARK_COMPLEMENT"                        = "Complement",
+  "HALLMARK_INTERFERON_GAMMA_RESPONSE"         = "Interferon Gamma Response",
+  "HALLMARK_TNFA_SIGNALING_VIA_NFKB"           = "TNF-a Signaling via NF-kB",
+  "HALLMARK_INFLAMMATORY_RESPONSE"             = "Inflammatory Response",
+  "HALLMARK_IL6_JAK_STAT3_SIGNALING"           = "IL-6/JAK/STAT3 Signaling"
+)
+
+s4b_data <- hallmark_nes %>%
+  filter(NAME %in% selected_pathways) %>%
+  select(NAME, NES_prepost, NES_postpost, sign_flip)
+
+# Reshape to long format for dodged bars
+s4b_long <- s4b_data %>%
+  pivot_longer(cols = c(NES_prepost, NES_postpost),
+               names_to = "Comparison", values_to = "NES") %>%
+  mutate(
+    Comparison   = ifelse(Comparison == "NES_prepost",
+                          "Pre-menopause", "Post-menopause"),
+    color_flag   = ifelse(sign_flip, "Sign flip", "No sign flip"),
+    display_name = display_names[NAME]
+  )
+
+# Order pathways by Pre-menopause NES
+pathway_order <- s4b_data %>% arrange(NES_prepost) %>% pull(NAME)
+s4b_long <- s4b_long %>%
+  mutate(display_name = factor(display_name,
+                               levels = display_names[pathway_order]))
+
+fig4b <- ggplot(s4b_long, aes(x = NES, y = display_name, fill = Comparison)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.75),
+           width = 0.7, color = "white", linewidth = 0.5, alpha = 0.9) +
+  # Highlight sign-flip pathways with red border
+  geom_bar(data = subset(s4b_long, color_flag == "Sign flip"),
+           aes(x = NES, y = display_name, fill = Comparison),
+           stat = "identity", position = position_dodge(width = 0.75),
+           width = 0.7, color = "#E63946", linewidth = 1.9, alpha = 0.9) +
+  geom_vline(xintercept = 0, color = "grey40", linewidth = 0.8) +
+  scale_fill_manual(
+    values = c("Pre-menopause" = "#2E86AB", "Post-menopause" = "#F77F00"),
+    name = NULL
+  ) +
+  scale_x_continuous(breaks = seq(-3, 3, by = 0.5)) +
+  labs(
+    x = "Normalized Enrichment Score (NES)\n<- Enriched in SLOW          Enriched in FAST ->",
+    y = ""
+  ) +
+  theme_minimal(base_size = 28) +
+  theme(
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.5),
+    panel.grid.major.x = element_line(color = "grey85", linewidth = 0.3),
+    panel.grid.minor   = element_blank(),
+    panel.background   = element_rect(fill = "white", color = NA),
+    plot.background    = element_rect(fill = "white", color = NA),
+    axis.text.y  = element_text(size = 30, color = "black", face = "bold"),
+    axis.text.x  = element_text(size = 28, color = "grey20"),
+    axis.title.x = element_text(size = 28, face = "bold", margin = margin(t = 15)),
+    axis.title.y = element_text(size = 32, face = "bold", margin = margin(r = 5)),
+    legend.position    = "top",
+    legend.direction   = "horizontal",
+    legend.text        = element_text(size = 32, face = "bold"),
+    legend.key.size    = unit(0.8, "cm"),
+    plot.margin        = margin(10, 10, 10, 3)
+  ) +
+  guides(fill = guide_legend(override.aes = list(color = NA)))
+
+print(fig4b)
+
+
+# ============================================================================
+# 7.  FIGURE 4C — Gene Expression log2FC Heatmap
+# ============================================================================
+# Heatmap of log2 fold change (Fast vs Stagnant pace tertiles) for 24 genes
+# spanning EGFR ligands, SASP factors, innate immune markers, and
+# proliferation genes. Computed for All women, Pre-M only, and Post-M only.
+
+cat("\n========================================\n")
+cat("  Figure 4C: Gene Expression Heatmap\n")
+cat("========================================\n")
+
+genes_4c <- c(
+  "EREG", "AREG", "EGFR",
+  "IL6", "CXCL8", "MMP1", "MMP3",
+  "CD14", "CSF1R", "ITGAM", "FCGR3A.B",
+  "MKI67", "TOP2A", "PCNA", "MCM2", "CCNB1", "CCNE1", "CDC20",
+  "AURKA", "BIRC5", "MAD2L1", "UBE2C", "CENPF", "CCNA2"
+)
+
+mbc_data <- mbc_data %>%
+  mutate(across(any_of(genes_4c), as.numeric))
+
+# Compute log2FC for a given subset: mean(log2(Fast+1)) - mean(log2(Stagnant+1))
+compute_log2fc <- function(df, genes, pace_col = "pace_index") {
+  qs <- quantile(df[[pace_col]], c(1/3, 2/3), na.rm = TRUE)
+  df <- df %>%
+    mutate(pace_group = case_when(
+      .data[[pace_col]] <= qs[1] ~ "STAGNANT",
+      .data[[pace_col]] >= qs[2] ~ "FAST",
+      TRUE ~ NA_character_
+    )) %>%
+    filter(!is.na(pace_group))
+
+  bind_rows(lapply(genes, function(g) {
+    tibble(
+      gene   = g,
+      log2FC = mean(log2(df %>% filter(pace_group == "FAST") %>% pull(g) + 1),
+                    na.rm = TRUE) -
+               mean(log2(df %>% filter(pace_group == "STAGNANT") %>% pull(g) + 1),
+                    na.rm = TRUE)
+    )
+  }))
+}
+
+heatmap_data <- bind_rows(
+  compute_log2fc(mbc_data, genes_4c) %>% mutate(stratum = "All"),
+  compute_log2fc(mbc_data %>% filter(meno.3group == "Pre-Post"), genes_4c) %>%
+    mutate(stratum = "Pre-M"),
+  compute_log2fc(mbc_data %>% filter(meno.3group == "Post-Post"), genes_4c) %>%
+    mutate(stratum = "Post-M")
+) %>%
+  mutate(
+    gene    = factor(gene, levels = rev(genes_4c)),
+    stratum = factor(stratum, levels = c("All", "Pre-M", "Post-M"))
+  )
+
+fig4c <- ggplot(heatmap_data, aes(x = stratum, y = gene, fill = log2FC)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0,
+    limits = c(-0.75, 0.75), oob = squish,
+    name = "log2 Fold Change\n(Fast - Stagnant)"
+  ) +
+  labs(
+    title    = "Gene Expression Fold Changes",
+    subtitle = "Fast vs Slow Involution Associated Genes Across Menopause",
+    caption  = "Blue = higher in SLOW pace | Red = higher in FAST pace"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 30, hjust = 0.5,
+                                  margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 20, hjust = 0.5,
+                                  margin = margin(b = 15)),
+    plot.caption  = element_text(size = 20, hjust = 0.5, face = "italic",
+                                  margin = margin(t = 10)),
+    axis.title    = element_blank(),
+    axis.text.x   = element_text(angle = 0, hjust = 0.5, size = 19, face = "bold"),
+    axis.text.y   = element_text(size = 22, face = "bold"),
+    panel.grid    = element_blank(),
+    panel.border  = element_rect(color = text_color, fill = NA, linewidth = 1),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.position    = "right",
+    legend.title       = element_text(face = "bold", size = 21),
+    legend.text        = element_text(size = 19),
+    legend.key.height  = unit(2, "cm"),
+    legend.key.width   = unit(0.5, "cm"),
+    plot.margin        = margin(20, 20, 20, 20)
+  )
+
+print(fig4c)
+
+
+# ============================================================================
+# 8.  SHARED INFRASTRUCTURE FOR 4D-K — Transcript Signature Analyses
+# ============================================================================
+# Both the SASP and Hub signature analyses follow the same structure:
+#   1. Create a composite z-scored transcript score
+#   2. Fit OLS: pace ~ score * menopause_proximity (+ covariates)
+#   3. Compute conditional slopes across years-to-menopause
+#   4. Stratify by trajectory and test interaction
+#
+# This section prepares the shared modelling dataset and defines reusable
+# plotting functions.
+
+cat("\n========================================\n")
+cat("  Preparing Modelling Dataset (4D-K)\n")
+cat("========================================\n")
+
+# --- Complete-case modelling subset ---
+model_vars <- c("pace_index", "years_to_meno_init", "years.between.biop",
+                "init.med.lob.area2", "init.med.lob.acini2")
+
+model_data <- mbc_data %>%
+  filter(complete.cases(across(all_of(model_vars)))) %>%
+  mutate(
+    z_pace       = as.numeric(scale(pace_index)),
+    z_proximity  = as.numeric(scale(years_to_meno_init)),
+    z_interval   = as.numeric(scale(years.between.biop)),
+    z_init_area  = as.numeric(scale(init.med.lob.area2)),
+    z_init_acini = as.numeric(scale(init.med.lob.acini2))
+  )
+
+pre_df  <- model_data %>% filter(years_to_meno_init > 0)
+post_df <- model_data %>% filter(years_to_meno_init <= 0)
+
+cat("  Total N:", nrow(model_data), "\n")
+cat("  Pre-menopausal:", nrow(pre_df), "\n")
+cat("  Post-menopausal:", nrow(post_df), "\n")
+
+# --- Reusable: stratified scatter plot ---
+#' @param df     Data with z_score and z_pace columns.
+#' @param x_col  Name of the z-scored predictor column.
+#' @param title  Plot title (coloured by color_main).
+#' @param xlab   X-axis label.
+plot_stratified_scatter <- function(df, x_col, title, xlab, color_main, stats) {
+  subtitle_text <- sprintf("beta = %.3f, R2 = %.3f, p = %.3f, N = %d",
+                           stats$slope, stats$r2, stats$p, nrow(df))
+  ggplot(df, aes(x = .data[[x_col]], y = z_pace)) +
+    geom_point(alpha = 0.5, color = color_main, size = 2.5, stroke = 0) +
+    geom_smooth(method = "lm", se = TRUE, color = color_main, fill = color_main,
+                alpha = 0.15, linewidth = 1.5) +
+    labs(title = title, subtitle = subtitle_text, x = xlab, y = "Pace (z)") +
+    theme_minimal(base_size = 14) +
+    theme(
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white", color = NA),
+      plot.title    = element_text(size = 28, face = "bold", hjust = 0.5,
+                                    color = color_main, margin = margin(b = 5)),
+      plot.subtitle = element_text(size = 22, hjust = 0.5, color = "grey40",
+                                    margin = margin(b = 8)),
+      axis.title    = element_text(size = 22, face = "bold", color = "grey20"),
+      axis.text     = element_text(size = 20, color = "grey20"),
+      axis.line     = element_line(color = "grey60", linewidth = 0.4),
+      axis.ticks    = element_line(color = "grey60"),
+      plot.margin   = margin(15, 15, 12, 12)
+    )
+}
+
+# --- Reusable: compute stratified regression stats ---
+compute_stratum_stats <- function(df, x_col) {
+  f <- as.formula(paste("z_pace ~", x_col))
+  fit <- lm(f, data = df)
+  s   <- summary(fit)
+  list(
+    slope = coef(fit)[[x_col]],
+    r2    = s$r.squared,
+    p     = s$coefficients[x_col, "Pr(>|t|)"]
+  )
+}
+
+# --- Reusable: interaction plot (conditional slope across years to meno) ---
+plot_interaction <- function(interaction_df, beta_int, p_int, n,
+                              title, ylab, score_label) {
+  y_range  <- c(min(interaction_df$lower), max(interaction_df$upper))
+  y_expand <- diff(y_range) * 0.15
+  y_top    <- max(interaction_df$upper)
+  y_bottom <- min(interaction_df$lower)
+
+  ggplot(interaction_df, aes(x = years)) +
+    # Shaded regions
+    annotate("rect", xmin = 0, xmax = -10, ymin = y_range[1] - y_expand,
+             ymax = y_range[2] + y_expand, fill = "#E8F4F8", alpha = 0.3) +
+    annotate("rect", xmin = 10, xmax = 0, ymin = y_range[1] - y_expand,
+             ymax = y_range[2] + y_expand, fill = "#FFF4E6", alpha = 0.3) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = "#B0B0B0", alpha = 0.25) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40",
+               linewidth = 0.7) +
+    geom_vline(xintercept = 0, linetype = "solid", color = "#D62828",
+               linewidth = 1.2, alpha = 0.7) +
+    geom_line(aes(y = slope), color = "#8B0000", linewidth = 1.8, alpha = 0.9) +
+    # Interpretation annotations
+    annotate("text", x = 7, y = y_bottom * 0.8,
+             label = paste0(score_label, " genes predict\nSLOWER involution"),
+             color = "#A8342C", fontface = "bold", size = 4.5, lineheight = 0.9) +
+    annotate("text", x = -7, y = y_top * 0.8,
+             label = paste0(score_label, " genes predict\nFASTER involution"),
+             color = "#2D5F2E", fontface = "bold", size = 4.5, lineheight = 0.9) +
+    # Phase labels
+    annotate("text", x = 5, y = y_range[2] + y_expand * 0.7,
+             label = "PRE-MENOPAUSAL", color = pre_color, fontface = "bold",
+             size = 5, alpha = 0.8) +
+    annotate("text", x = -5, y = y_range[2] + y_expand * 0.7,
+             label = "POST-MENOPAUSAL", color = post_color, fontface = "bold",
+             size = 5, alpha = 0.8) +
+    labs(
+      title    = title,
+      subtitle = sprintf("beta = %.3f, p = %.3f, N = %d",
+                         beta_int, p_int, n),
+      x = "Years to Menopause\n(PRE <- | -> POST)",
+      y = ylab
+    ) +
+    scale_x_reverse(breaks = seq(-10, 10, by = 2)) +
+    coord_cartesian(ylim = c(y_range[1] - y_expand, y_range[2] + y_expand),
+                    expand = FALSE) +
+    theme_minimal(base_size = 14) +
+    theme(
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.4),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white", color = NA),
+      plot.title    = element_text(size = 24, face = "bold", hjust = 0.5,
+                                    margin = margin(b = 6)),
+      plot.subtitle = element_text(size = 20, color = "grey30", hjust = 0.5,
+                                    margin = margin(b = 10)),
+      axis.title    = element_text(size = 24, face = "bold", color = "grey20"),
+      axis.text     = element_text(size = 20, color = "grey20"),
+      axis.line     = element_line(color = "grey60", linewidth = 0.5),
+      axis.ticks    = element_line(color = "grey60"),
+      plot.margin   = margin(20, 20, 15, 15),
+      legend.position = "none"
+    )
+}
+
+# --- Reusable: trajectory forest plot ---
+plot_trajectory_forest <- function(forest_df, int_p, xlab) {
+  x_range  <- range(c(forest_df$ci_lower, forest_df$ci_upper))
+  x_extend <- diff(x_range) * 0.15
+
+  ggplot(forest_df, aes(x = beta, y = trajectory)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey40",
+               linewidth = 0.9) +
+    geom_errorbarh(aes(xmin = ci_lower, xmax = ci_upper, color = trajectory),
+                   height = 0, linewidth = 2.5, alpha = 0.6) +
+    geom_errorbarh(aes(xmin = ci_lower, xmax = ci_upper, color = trajectory),
+                   height = 0.15, linewidth = 1.5, alpha = 0.9) +
+    geom_point(aes(color = trajectory, fill = trajectory),
+               size = 5.5, shape = 23, stroke = 1.5, alpha = 0.9) +
+    geom_point(data = subset(forest_df, significant),
+               aes(color = trajectory),
+               size = 6.5, shape = 23, stroke = 2, alpha = 1) +
+    scale_color_manual(
+      values = c("Pre-menopausal" = pre_color, "Post-menopausal" = post_color),
+      guide = "none"
+    ) +
+    scale_fill_manual(
+      values = c("Pre-menopausal" = "#FFA94D", "Post-menopausal" = "#5DADE2"),
+      guide = "none"
+    ) +
+    geom_text(
+      aes(x = ci_upper + diff(x_range) * 0.08,
+          label = sprintf("beta = %.2f\np = %.3g\nN = %d", beta, p_value, n)),
+      size = 6.3, hjust = 0, fontface = "bold", lineheight = 0.9,
+      color = "grey20"
+    ) +
+    labs(
+      subtitle = sprintf("Global Interaction p = %.3f", int_p),
+      x        = xlab, y = NULL
+    ) +
+    coord_cartesian(
+      xlim = c(x_range[1] - x_extend, x_range[2] + x_extend * 1.8),
+      clip = "off"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      panel.grid.major.y = element_blank(),
+      panel.grid.major.x = element_line(color = "grey88", linewidth = 0.4),
+      panel.grid.minor   = element_blank(),
+      panel.background   = element_rect(fill = "white", color = NA),
+      plot.background    = element_rect(fill = "white", color = NA),
+      plot.subtitle = element_text(size = 26, face = "bold", color = "grey10",
+                                    hjust = 0.5, margin = margin(b = 15)),
+      axis.text.y   = element_blank(),
+      axis.text.x   = element_text(size = 22, color = "grey20"),
+      axis.title.x  = element_text(size = 22, face = "bold",
+                                    margin = margin(t = 12), color = "grey20"),
+      axis.title.y  = element_blank(),
+      axis.line.x   = element_line(color = "grey60", linewidth = 0.5),
+      axis.ticks.x  = element_line(color = "grey60"),
+      axis.ticks.y  = element_blank(),
+      plot.margin   = margin(20, 35, 15, 15)
+    )
+}
+
+# --- Reusable: run full 4-panel signature analysis ---
+#' @param score_col  Column name in model_data for the composite z-score.
+#' @param score_label Short label (e.g., "SASP", "Hub").
+#' @return Named list of 4 ggplot objects.
+run_signature_analysis <- function(score_col, score_label) {
+  z_col <- paste0("z_", score_label)
+  model_data[[z_col]] <- as.numeric(scale(model_data[[score_col]]))
+  pre_df[[z_col]]     <- as.numeric(scale(pre_df[[score_col]]))
+  post_df[[z_col]]    <- as.numeric(scale(post_df[[score_col]]))
+
+  # --- Scatter stats ---
+  stats_pre  <- compute_stratum_stats(pre_df, z_col)
+  stats_post <- compute_stratum_stats(post_df, z_col)
+
+  p_scatter_pre <- plot_stratified_scatter(
+    pre_df, z_col, "PRE-MENOPAUSAL",
+    paste0(score_label, " Score (z)"), pre_color, stats_pre)
+  p_scatter_post <- plot_stratified_scatter(
+    post_df, z_col, "POST-MENOPAUSAL",
+    paste0(score_label, " Score (z)"), post_color, stats_post)
+
+  # --- Interaction model ---
+  f_int <- as.formula(paste0("z_pace ~ ", z_col,
+    " * z_proximity + z_interval + z_init_area + z_init_acini"))
+  full_fit <- lm(f_int, data = model_data)
+  cs       <- summary(full_fit)
+  vcov_mat <- vcov(full_fit)
+
+  int_term   <- paste0(z_col, ":z_proximity")
+  beta_score <- coef(full_fit)[[z_col]]
+  beta_int   <- coef(full_fit)[[int_term]]
+  p_int      <- cs$coefficients[int_term, "Pr(>|t|)"]
+
+  # Conditional slopes
+  mean_prox <- mean(model_data$years_to_meno_init, na.rm = TRUE)
+  sd_prox   <- sd(model_data$years_to_meno_init, na.rm = TRUE)
+  year_seq  <- seq(-10, 10, by = 0.25)
+  z_seq     <- (year_seq - mean_prox) / sd_prox
+
+  var_b  <- vcov_mat[z_col, z_col]
+  var_i  <- vcov_mat[int_term, int_term]
+  cov_bi <- vcov_mat[z_col, int_term]
+
+  slope_vals <- beta_score + beta_int * z_seq
+  se_vals    <- sqrt(var_b + (z_seq^2) * var_i + 2 * z_seq * cov_bi)
+
+  int_df <- data.frame(
+    years = year_seq, slope = slope_vals,
+    lower = slope_vals - 1.96 * se_vals,
+    upper = slope_vals + 1.96 * se_vals
+  )
+
+  p_interaction <- plot_interaction(
+    int_df, beta_int, p_int, nrow(model_data),
+    title = paste0(score_label, " Score x Menopause -> Pace"),
+    ylab  = paste0(score_label, " Effect (beta)"),
+    score_label = score_label
+  )
+
+  # --- Trajectory forest plot ---
+  traj_data <- mbc_data %>%
+    mutate(pace_index = as.numeric(pace_regpos),
+           traj = as.character(meno.3group)) %>%
+    filter(traj %in% c("Pre-Post", "Post-Post"),
+           !is.na(.data[[score_col]]), !is.na(pace_index)) %>%
+    mutate(traj = factor(traj, levels = c("Pre-Post", "Post-Post")))
+
+  traj_data <- traj_data %>%
+    group_by(traj) %>%
+    mutate(z_score_local = as.numeric(scale(.data[[score_col]])),
+           z_pace_local  = as.numeric(scale(pace_index))) %>%
+    ungroup()
+
+  fit_traj_fn <- function(df) {
+    fit <- lm(z_pace_local ~ z_score_local, data = df)
+    s   <- summary(fit)
+    list(beta = coef(fit)[["z_score_local"]],
+         se   = s$coefficients["z_score_local", "Std. Error"],
+         p    = s$coefficients["z_score_local", "Pr(>|t|)"],
+         n    = nrow(df), r2 = s$r.squared)
+  }
+
+  st_pre  <- fit_traj_fn(traj_data %>% filter(traj == "Pre-Post"))
+  st_post <- fit_traj_fn(traj_data %>% filter(traj == "Post-Post"))
+
+  # Global interaction test
+  traj_data <- traj_data %>%
+    mutate(z_score_global = as.numeric(scale(.data[[score_col]])),
+           z_pace_global  = as.numeric(scale(pace_index)))
+  int_mod <- lm(z_pace_global ~ z_score_global * traj, data = traj_data)
+  int_p_traj <- summary(int_mod)$coefficients[
+    "z_score_global:trajPost-Post", "Pr(>|t|)"]
+
+  forest_df <- tibble(
+    trajectory = factor(c("Pre-menopausal", "Post-menopausal"),
+                        levels = c("Post-menopausal", "Pre-menopausal")),
+    beta     = c(st_pre$beta, st_post$beta),
+    ci_lower = c(st_pre$beta - 1.96 * st_pre$se,
+                 st_post$beta - 1.96 * st_post$se),
+    ci_upper = c(st_pre$beta + 1.96 * st_pre$se,
+                 st_post$beta + 1.96 * st_post$se),
+    p_value  = c(st_pre$p, st_post$p),
+    n        = c(st_pre$n, st_post$n),
+    significant = c(st_pre$p < 0.05, st_post$p < 0.05)
+  )
+
+  p_forest <- plot_trajectory_forest(
+    forest_df, int_p_traj,
+    xlab = paste0("Effect Size (beta) per 1 SD ", score_label)
+  )
+
+  list(scatter_pre = p_scatter_pre, scatter_post = p_scatter_post,
+       interaction = p_interaction, forest = p_forest)
+}
+
+
+# ============================================================================
+# 9.  CREATE COMPOSITE SCORES
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Creating Composite Scores\n")
+cat("========================================\n")
+
+# --- SASP score: z-scored mean of log1p-transformed SASP genes ---
+sasp_genes <- c("IL6", "CXCL8", "MMP1", "MMP3", "EREG")
+available_sasp <- sasp_genes[sasp_genes %in% names(mbc_data)]
+cat("  SASP genes (", length(available_sasp), "):", paste(available_sasp, collapse = ", "), "\n")
+
+sasp_mat <- mbc_data[available_sasp]
+for (g in available_sasp) sasp_mat[[g]] <- log1p(as.numeric(sasp_mat[[g]]))
+mbc_data$SASP_Score <- rowMeans(scale(sasp_mat), na.rm = TRUE)
+
+# --- Hub score: z-scored mean of log1p-transformed hub genes ---
+hub_genes <- unique(c(
+  "EREG", "AREG", "EGF", "EGFR",
+  "IL6", "JAK1", "STAT3", "SOCS3", "IL1A", "IL1B", "CXCL8",
+  "FCGR3A", "FCGR3B", "FCGR3A.B"
+))
+available_hub <- hub_genes[hub_genes %in% names(mbc_data)]
+cat("  Hub genes (", length(available_hub), "):", paste(available_hub, collapse = ", "), "\n")
+
+hub_mat <- mbc_data[available_hub]
+for (g in available_hub) hub_mat[[g]] <- log1p(as.numeric(hub_mat[[g]]))
+mbc_data$Hub_score <- rowMeans(scale(hub_mat), na.rm = TRUE)
+
+# Propagate scores to modelling subsets
+model_data <- model_data %>%
+  left_join(mbc_data %>% select(pace_regpos, SASP_Score, Hub_score) %>% distinct(),
+            by = "pace_regpos")
+pre_df  <- model_data %>% filter(years_to_meno_init > 0)
+post_df <- model_data %>% filter(years_to_meno_init <= 0)
+
+
+# ============================================================================
+# 10. FIGURES 4D-G — SASP Transcript Signature
+# ============================================================================
+# 4D = Pre-meno scatter, 4E = Post-meno scatter,
+# 4F = Interaction plot, 4G = Trajectory forest plot.
+
+cat("\n========================================\n")
+cat("  Figures 4D-G: SASP Signature\n")
+cat("========================================\n")
+
+sasp_plots <- run_signature_analysis("SASP_Score", "SASP")
+
+print(sasp_plots$scatter_pre)   # Fig 4D
+print(sasp_plots$scatter_post)  # Fig 4E
+print(sasp_plots$interaction)   # Fig 4F
+print(sasp_plots$forest)        # Fig 4G
+
+
+# ============================================================================
+# 11. FIGURES 4H-K — Inflammatory Hub Transcript Signature
+# ============================================================================
+# 4H = Pre-meno scatter, 4I = Post-meno scatter,
+# 4J = Interaction plot, 4K = Trajectory forest plot.
+
+cat("\n========================================\n")
+cat("  Figures 4H-K: Hub Signature\n")
+cat("========================================\n")
+
+hub_plots <- run_signature_analysis("Hub_score", "Hub")
+
+print(hub_plots$scatter_pre)    # Fig 4H
+print(hub_plots$scatter_post)   # Fig 4I
+print(hub_plots$interaction)    # Fig 4J
+print(hub_plots$forest)         # Fig 4K
+
+
+# ============================================================================
+# 12. SESSION COMPLETE
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Figure 4 (4A-K) Complete\n")
+cat("========================================\n")
+cat("  Figures: 4A, 4B, 4C, 4D-G (SASP), 4H-K (Hub)\n")
+
+# ============================================================================
+# Supplementary Figure S4 — Figures S4A-F
+# Gene Expression Heatmaps, Signature Interaction Analyses, and Stability
+# ============================================================================
+#
+# Description:
+#   Supplementary analyses supporting Figure 4. Uses the same NanoString
+#   clinical expression dataset (mbc_data) loaded in Figure4_complete.R.
+#
+# Figures produced:
+#   Fig S4A — ComplexHeatmap: sample-level z-scored gene expression for
+#             Pre-M and Post-M strata, with gene panel row annotations
+#             and pace-group column annotations (STAGNANT vs FAST tertiles).
+#   Fig S4B — Imaging subset log2FC heatmap: same 24-gene set as Fig 4C
+#             restricted to the 14 women with multiplex imaging data.
+#   Fig S4C — STAT pathway signature x menopause proximity interaction
+#             (conditional slope plot across years to menopause).
+#   Fig S4D — Cytokine/STAT3-SASP signature x menopause proximity
+#             interaction (wider year range: -20 to +20).
+#   Fig S4E — EGFR signature x menopause proximity interaction.
+#   Fig S4F — Hub12 leave-one-gene-out stability: forest plot of
+#             interaction coefficients when each hub gene is excluded.
+#
+# Prerequisite:
+#   Run Figure4_complete.R first (through Section 8). This script expects:
+#     - mbc_data     (NanoString clinical dataset with scores computed)
+#     - model_data   (complete-case modelling subset with z-scored covariates)
+#     - model_vars   (vector of covariate names)
+#
+# Dependencies:
+#   dplyr, tidyr, readr, ggplot2, scales, ComplexHeatmap, circlize, grid
+# ============================================================================
+
+
+# ============================================================================
+# 0.  ADDITIONAL PACKAGES
+# ============================================================================
+
+suppressPackageStartupMessages({
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+
+# ============================================================================
+# 1.  SHARED CONSTANTS
+# ============================================================================
+
+# 24-gene list used across 4C, S4A, S4B
+genes_all <- c(
+  "EREG", "AREG", "EGFR",
+  "IL6", "CXCL8", "MMP1", "MMP3",
+  "CD14", "CSF1R", "ITGAM", "FCGR3A.B",
+  "MKI67", "TOP2A", "PCNA", "MCM2", "CCNB1", "CCNE1", "CDC20",
+  "AURKA", "BIRC5", "MAD2L1", "UBE2C", "CENPF", "CCNA2"
+)
+
+# Gene panel annotations (for S4A row splits)
+gene_panels <- tibble::tribble(
+  ~panel,               ~gene,
+  "EGFR axis",          "EREG",
+  "EGFR axis",          "AREG",
+  "EGFR axis",          "EGFR",
+  "SASP core",          "IL6",
+  "SASP core",          "CXCL8",
+  "SASP core",          "MMP1",
+  "SASP core",          "MMP3",
+  "Myeloid activation", "CD14",
+  "Myeloid activation", "CSF1R",
+  "Myeloid activation", "ITGAM",
+  "Myeloid activation", "FCGR3A.B",
+  "Proliferation",      "MKI67",
+  "Proliferation",      "TOP2A",
+  "Proliferation",      "PCNA",
+  "Proliferation",      "MCM2",
+  "Proliferation",      "CCNB1",
+  "Proliferation",      "CCNE1",
+  "Proliferation",      "CDC20",
+  "Proliferation",      "AURKA",
+  "Proliferation",      "BIRC5",
+  "Proliferation",      "MAD2L1",
+  "Proliferation",      "UBE2C",
+  "Proliferation",      "CENPF",
+  "Proliferation",      "CCNA2"
+)
+
+#' Assign pace tertile groups (STAGNANT / MID / FAST).
+#' @param x Numeric vector of pace values.
+#' @return Factor with levels STAGNANT, MID, FAST.
+get_pace_groups <- function(x) {
+  q <- quantile(x, c(1/3, 2/3), na.rm = TRUE)
+  g <- rep("MID", length(x))
+  g[x <= q[1]] <- "STAGNANT"
+  g[x >= q[2]] <- "FAST"
+  factor(g, levels = c("STAGNANT", "MID", "FAST"))
+}
+
+
+# ============================================================================
+# 2.  FIGURE S4A — ComplexHeatmap (Sample-Level Z-Scores)
+# ============================================================================
+# For each menopausal stratum, samples are split into STAGNANT and FAST
+# pace tertiles, gene-wise z-scored, and displayed with a mean-difference
+# row inserted between the two groups.
+
+cat("\n========================================\n")
+cat("  Figure S4A: ComplexHeatmap\n")
+cat("========================================\n")
+
+mbc_data <- mbc_data %>%
+  mutate(across(any_of(genes_all), as.numeric))
+
+# --- Build z-scored matrix with mean-difference row ---
+#' @param dat  Data frame subset (one menopausal stratum).
+#' @return     Transposed matrix (genes x [stagnant samples | mean | fast samples]).
+make_heatmap_matrix <- function(dat) {
+  dat <- dat %>%
+    filter(!is.na(pace_regpos)) %>%
+    mutate(pace_group = get_pace_groups(as.numeric(pace_regpos))) %>%
+    filter(pace_group %in% c("STAGNANT", "FAST"))
+
+  stag <- dat %>% filter(pace_group == "STAGNANT") %>% arrange(desc(pace_regpos))
+  fast <- dat %>% filter(pace_group == "FAST") %>% arrange(desc(pace_regpos))
+
+  # Log2-transform and gene-wise z-score across all retained samples
+  mat_all <- rbind(
+    log2(as.matrix(stag[, genes_all]) + 1),
+    log2(as.matrix(fast[, genes_all]) + 1)
+  )
+  zmat <- scale(mat_all)
+
+  # Insert a mean-difference row between the two groups
+  n_stag    <- nrow(stag)
+  mean_diff <- colMeans(zmat[(n_stag + 1):nrow(zmat), , drop = FALSE]) -
+               colMeans(zmat[1:n_stag, , drop = FALSE])
+  mean_row  <- matrix(mean_diff, nrow = 1)
+  rownames(mean_row) <- "Mean"
+
+  t(rbind(zmat[1:n_stag, , drop = FALSE], mean_row,
+          zmat[(n_stag + 1):nrow(zmat), , drop = FALSE]))
+}
+
+mat_pre  <- make_heatmap_matrix(mbc_data %>% filter(meno.3group == "Pre-Post"))
+mat_post <- make_heatmap_matrix(mbc_data %>% filter(meno.3group == "Post-Post"))
+
+cat("  Pre-M matrix:", nrow(mat_pre), "genes x", ncol(mat_pre), "columns\n")
+cat("  Post-M matrix:", nrow(mat_post), "genes x", ncol(mat_post), "columns\n")
+
+# --- Column annotations (pace group labels) ---
+pace_colors <- c("Stagnant" = "#6A51A3", "Mean" = "#BDBDBD", "Fast" = "#31A354")
+
+make_pace_annotation <- function(dat) {
+  dat <- dat %>%
+    filter(!is.na(pace_regpos)) %>%
+    mutate(pace_group = get_pace_groups(as.numeric(pace_regpos))) %>%
+    filter(pace_group %in% c("STAGNANT", "FAST"))
+  cg <- count(dat, pace_group)
+  n_stag <- cg$n[cg$pace_group == "STAGNANT"]
+  n_fast <- cg$n[cg$pace_group == "FAST"]
+  HeatmapAnnotation(
+    Pace = c(rep("Stagnant", n_stag), "Mean", rep("Fast", n_fast)),
+    col = list(Pace = pace_colors),
+    show_annotation_name = FALSE,
+    annotation_legend_param = list(
+      Pace = list(
+        title = "Involution Pace",
+        title_gp = gpar(fontsize = 18, fontface = "bold"),
+        labels_gp = gpar(fontsize = 16)
+      )
+    )
+  )
+}
+
+ha_pre  <- make_pace_annotation(mbc_data %>% filter(meno.3group == "Pre-Post"))
+ha_post <- make_pace_annotation(mbc_data %>% filter(meno.3group == "Post-Post"))
+
+# --- Row annotation (gene panel colours) ---
+row_ha <- rowAnnotation(
+  Panel = gene_panels$panel,
+  show_annotation_name = FALSE,
+  annotation_legend_param = list(
+    Panel = list(
+      title = "Gene Panel",
+      title_gp = gpar(fontsize = 18, fontface = "bold"),
+      labels_gp = gpar(fontsize = 16)
+    )
+  )
+)
+
+# --- Heatmap colour function ---
+col_fun <- colorRamp2(c(-2.5, 0, 2.5), c("#2166AC", "white", "#B2182B"))
+
+# --- Draw side-by-side heatmaps ---
+ht_pre <- Heatmap(
+  mat_pre, name = "z-score", col = col_fun,
+  cluster_rows = FALSE, cluster_columns = FALSE,
+  show_column_names = FALSE, show_row_names = TRUE,
+  row_names_gp   = gpar(fontsize = 18, fontface = "bold"),
+  row_split       = gene_panels$panel,
+  row_title_gp    = gpar(fontsize = 14, fontface = "bold"),
+  row_gap         = unit(2, "mm"), border = TRUE,
+  left_annotation = row_ha, top_annotation = ha_pre,
+  column_title    = "Pre-Menopause",
+  column_title_gp = gpar(fontsize = 20, fontface = "bold"),
+  heatmap_legend_param = list(
+    title = "z-score",
+    title_gp = gpar(fontsize = 18, fontface = "bold"),
+    labels_gp = gpar(fontsize = 16),
+    legend_height = unit(4, "cm"), grid_width = unit(0.5, "cm")
+  )
+)
+
+ht_post <- Heatmap(
+  mat_post, name = "z-score", col = col_fun,
+  cluster_rows = FALSE, cluster_columns = FALSE,
+  show_column_names = FALSE, show_row_names = TRUE,
+  row_names_gp   = gpar(fontsize = 16, fontface = "bold"),
+  row_split       = gene_panels$panel,
+  row_title_gp    = gpar(fontsize = 14, fontface = "bold"),
+  row_gap         = unit(2, "mm"), border = TRUE,
+  left_annotation = row_ha, top_annotation = ha_post,
+  column_title    = "Post-Menopause",
+  column_title_gp = gpar(fontsize = 20, fontface = "bold"),
+  show_heatmap_legend = FALSE
+)
+
+ht_list <- ht_pre + ht_post
+
+draw(ht_list,
+     column_title = "Gene Expression Heatmaps",
+     column_title_gp = gpar(fontsize = 16, fontface = "bold"),
+     padding = unit(c(2, 2, 2, 2), "mm"))
+
+
+# ============================================================================
+# 3.  FIGURE S4B — Imaging Subset log2FC Heatmap
+# ============================================================================
+# Repeats the Fig 4C heatmap but restricted to the 14 women who also have
+# multiplex immunofluorescence imaging data. Validates that transcriptomic
+# patterns are recapitulated in the imaging cohort.
+#
+# NOTE: Imaging cohort block IDs are de-identified (P01-P14). The mapping
+# from P01-P14 to original init.block2 values is stored in
+# imaging_cohort_ids.csv (NOT included in the public repository).
+
+cat("\n========================================\n")
+cat("  Figure S4B: Imaging Subset Heatmap\n")
+cat("========================================\n")
+
+# Load de-identified imaging IDs from external mapping file.
+# File format: block_id (one column with 14 original init.block2 values)
+imaging_ids_path <- file.path(DATA_DIR, "imaging_cohort_ids.csv")
+if (file.exists(imaging_ids_path)) {
+  imaging_ids <- read_csv(imaging_ids_path, show_col_types = FALSE)$block_id
+} else {
+  # If mapping file is unavailable, the 14 IDs must be provided.
+  # Replace this placeholder with your actual block IDs locally.
+  warning("imaging_cohort_ids.csv not found — using placeholder.")
+  imaging_ids <- character(0)
+}
+
+mbc_img <- mbc_data %>% filter(init.block2 %in% imaging_ids)
+cat("  Imaging subset:", n_distinct(mbc_img$init.block2), "women\n")
+
+# --- Compute log2FC (Fast vs Stagnant) per gene per stratum ---
+compute_log2fc <- function(df_sub, genes, label) {
+  df_sub <- df_sub %>%
+    filter(!is.na(pace_regpos)) %>%
+    mutate(pace_group = get_pace_groups(as.numeric(pace_regpos))) %>%
+    filter(pace_group %in% c("FAST", "STAGNANT"))
+
+  bind_rows(lapply(genes, function(g) {
+    x_fast <- df_sub %>% filter(pace_group == "FAST") %>% pull(g)
+    x_stag <- df_sub %>% filter(pace_group == "STAGNANT") %>% pull(g)
+    tibble(
+      gene    = g,
+      stratum = label,
+      log2FC  = mean(log2(x_fast + 1), na.rm = TRUE) -
+                mean(log2(x_stag + 1), na.rm = TRUE)
+    )
+  }))
+}
+
+heatmap_img <- bind_rows(
+  compute_log2fc(mbc_img, genes_all, "All"),
+  compute_log2fc(mbc_img %>% filter(meno.3group == "Pre-Post"), genes_all, "Pre-M"),
+  compute_log2fc(mbc_img %>% filter(meno.3group == "Post-Post"), genes_all, "Post-M")
+) %>%
+  mutate(
+    gene    = factor(gene, levels = rev(genes_all)),
+    stratum = factor(stratum, levels = c("All", "Pre-M", "Post-M"))
+  )
+
+fig_s4b <- ggplot(heatmap_img, aes(x = stratum, y = gene, fill = log2FC)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0,
+    limits = c(-1.5, 1.5), oob = squish,
+    name = "log2 Fold Change\n(Fast - Stagnant)"
+  ) +
+  labs(
+    title    = "Imaging Subset",
+    subtitle = "Fast vs Slow Involution Associated Genes Across Menopause",
+    caption  = "Blue = higher in SLOW pace | Red = higher in FAST pace"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 30, hjust = 0.5,
+                                  margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 20, hjust = 0.5,
+                                  margin = margin(b = 15)),
+    plot.caption  = element_text(size = 20, hjust = 0.5, face = "italic",
+                                  margin = margin(t = 10)),
+    axis.title    = element_blank(),
+    axis.text.x   = element_text(angle = 0, hjust = 0.5, size = 19, face = "bold"),
+    axis.text.y   = element_text(size = 22, face = "bold"),
+    panel.grid    = element_blank(),
+    panel.border  = element_rect(color = "black", fill = NA, linewidth = 1),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.position    = "right",
+    legend.title       = element_text(face = "bold", size = 21),
+    legend.text        = element_text(size = 19),
+    legend.key.height  = unit(2, "cm"),
+    legend.key.width   = unit(0.5, "cm"),
+    plot.margin        = margin(20, 20, 20, 20)
+  )
+
+print(fig_s4b)
+
+
+# ============================================================================
+# 4.  SHARED INFRASTRUCTURE FOR S4C-E — Signature Interaction Plots
+# ============================================================================
+# S4C-E each test a different gene signature's interaction with menopause
+# proximity on involution pace. All follow the same analytic structure:
+#   OLS: z_pace ~ z_Score * z_proximity + z_interval + z_area + z_acini
+# and display the conditional slope of the score effect across years to
+# menopause.
+
+cat("\n========================================\n")
+cat("  Preparing S4C-E Interaction Plots\n")
+cat("========================================\n")
+
+#' Create a composite z-scored transcript score from a gene list.
+#' log1p-transforms each gene, z-scores, then averages across genes.
+#' @param df     Data frame (mbc_data).
+#' @param genes  Character vector of gene column names.
+#' @return Numeric vector of per-sample composite scores.
+make_score <- function(df, genes) {
+  avail <- genes[genes %in% names(df)]
+  mat <- df[avail]
+  for (g in avail) mat[[g]] <- log1p(as.numeric(mat[[g]]))
+  rowMeans(scale(mat), na.rm = TRUE)
+}
+
+#' Fit interaction model and compute conditional slopes.
+#' @param score_vec  Numeric vector (one per row of mbc_data).
+#' @param label      Short label for column naming.
+#' @param year_range Two-element numeric: c(min_year, max_year) for x-axis.
+#' @return List: interaction_df, beta_int, p_int, n, gene_list.
+fit_conditional_slopes <- function(score_vec, label, year_range = c(-10, 10)) {
+  z_col    <- paste0("z_", label)
+  int_term <- paste0(z_col, ":z_proximity")
+
+  md <- model_data %>%
+    mutate(!!z_col := as.numeric(scale(
+      score_vec[match(pace_regpos, mbc_data$pace_regpos)]
+    ))) %>%
+    filter(!is.na(.data[[z_col]]))
+
+  f   <- as.formula(paste0("z_pace ~ ", z_col,
+    " * z_proximity + z_interval + z_init_area + z_init_acini"))
+  fit <- lm(f, data = md)
+  cs  <- summary(fit)
+  vm  <- vcov(fit)
+
+  b_score <- coef(fit)[[z_col]]
+  b_int   <- coef(fit)[[int_term]]
+  p_int   <- cs$coefficients[int_term, "Pr(>|t|)"]
+
+  mean_prox <- mean(md$years_to_meno_init, na.rm = TRUE)
+  sd_prox   <- sd(md$years_to_meno_init, na.rm = TRUE)
+  year_seq  <- seq(year_range[1], year_range[2], by = 0.25)
+  z_seq     <- (year_seq - mean_prox) / sd_prox
+
+  var_b  <- vm[z_col, z_col]
+  var_i  <- vm[int_term, int_term]
+  cov_bi <- vm[z_col, int_term]
+  slopes <- b_score + b_int * z_seq
+  ses    <- sqrt(var_b + (z_seq^2) * var_i + 2 * z_seq * cov_bi)
+
+  list(
+    interaction_df = data.frame(
+      years = year_seq, slope = slopes,
+      lower = slopes - 1.96 * ses, upper = slopes + 1.96 * ses
+    ),
+    beta_int = b_int, p_int = p_int, n = nrow(md)
+  )
+}
+
+#' Plot conditional slope interaction (reusable for S4C-E).
+#' @param res         Output from fit_conditional_slopes().
+#' @param title       Plot title string.
+#' @param color_main  Main colour for ribbon and line.
+plot_supp_interaction <- function(res, title, color_main) {
+  idf      <- res$interaction_df
+  y_range  <- c(min(idf$lower), max(idf$upper))
+  y_expand <- diff(y_range) * 0.15
+
+  ggplot(idf, aes(x = years)) +
+    # Shaded menopausal phase regions
+    annotate("rect", xmin = 0, xmax = min(idf$years),
+             ymin = y_range[1] - y_expand, ymax = y_range[2] + y_expand,
+             fill = "#E8F4F8", alpha = 0.3) +
+    annotate("rect", xmin = max(idf$years), xmax = 0,
+             ymin = y_range[1] - y_expand, ymax = y_range[2] + y_expand,
+             fill = "#FFF4E6", alpha = 0.3) +
+    # Confidence ribbon
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = color_main, alpha = 0.25) +
+    # Reference lines
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40",
+               linewidth = 0.7) +
+    geom_vline(xintercept = 0, linetype = "solid", color = "#D62828",
+               linewidth = 1.2, alpha = 0.7) +
+    # Conditional slope line
+    geom_line(aes(y = slope), color = color_main, linewidth = 1.8, alpha = 0.9) +
+    # Phase labels
+    annotate("text", x = max(idf$years) * 0.5,
+             y = y_range[2] + y_expand * 0.7,
+             label = "PRE-MENOPAUSAL", color = "#D17A29", fontface = "bold",
+             size = 8, alpha = 0.8) +
+    annotate("text", x = min(idf$years) * 0.5,
+             y = y_range[2] + y_expand * 0.7,
+             label = "POST-MENOPAUSAL", color = "#2E7D9E", fontface = "bold",
+             size = 8, alpha = 0.8) +
+    labs(
+      title    = title,
+      subtitle = sprintf("Interaction beta = %.3f, p = %.4f | N = %d",
+                         res$beta_int, res$p_int, res$n),
+      x = "Years to Menopause\n(PRE <- | -> POST)",
+      y = "Effect Size (beta)"
+    ) +
+    scale_x_reverse(
+      breaks = seq(min(idf$years), max(idf$years), length.out = 11)
+    ) +
+    coord_cartesian(
+      ylim = c(y_range[1] - y_expand, y_range[2] + y_expand), expand = FALSE
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.4),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white", color = NA),
+      plot.title    = element_text(size = 26, face = "bold", hjust = 0.5,
+                                    margin = margin(b = 8)),
+      plot.subtitle = element_text(size = 26, color = "grey30", hjust = 0.5,
+                                    margin = margin(b = 15)),
+      axis.title    = element_text(size = 24, face = "bold", color = "grey20"),
+      axis.text     = element_text(size = 22, color = "grey20"),
+      axis.line     = element_line(color = "grey60", linewidth = 0.5),
+      axis.ticks    = element_line(color = "grey60"),
+      plot.margin   = margin(25, 25, 20, 20),
+      legend.position = "none"
+    )
+}
+
+
+# ============================================================================
+# 5.  FIGURE S4C — STAT Pathway Signature Interaction
+# ============================================================================
+# 7-gene STAT pathway composite: IL6, JAK1, STAT3, SOCS3, IL1A, IL1B, CXCL8.
+
+cat("\n========================================\n")
+cat("  Figure S4C: STAT Interaction\n")
+cat("========================================\n")
+
+stat_genes <- c("IL6", "JAK1", "STAT3", "SOCS3", "IL1A", "IL1B", "CXCL8")
+available_stat <- stat_genes[stat_genes %in% names(mbc_data)]
+cat("  Genes (", length(available_stat), "):", paste(available_stat, collapse = ", "), "\n")
+
+mbc_data$STAT_score <- make_score(mbc_data, stat_genes)
+res_stat <- fit_conditional_slopes(mbc_data$STAT_score, "STAT")
+cat(sprintf("  beta = %.3f, p = %.4f, N = %d\n",
+            res_stat$beta_int, res_stat$p_int, res_stat$n))
+
+fig_s4c <- plot_supp_interaction(
+  res_stat,
+  title      = "STAT Pathway Signature x Menopause-Pace Interaction",
+  color_main = "#E74C3C"
+)
+print(fig_s4c)
+
+
+# ============================================================================
+# 6.  FIGURE S4D — Cytokine/STAT3-SASP Signature Interaction
+# ============================================================================
+# 8-gene cytokine/STAT3-SASP composite: IL6, CXCL8, IL1A, IL1B, TNF,
+# CXCL1, CXCL2, SOCS3. Uses extended year range (-20, +20) to capture
+# the wider spread of this cohort's menopause proximity values.
+
+cat("\n========================================\n")
+cat("  Figure S4D: Cytokine/STAT3-SASP\n")
+cat("========================================\n")
+
+cytokine_genes <- c("IL6", "CXCL8", "IL1A", "IL1B", "TNF",
+                    "CXCL1", "CXCL2", "SOCS3")
+available_cyt <- cytokine_genes[cytokine_genes %in% names(mbc_data)]
+cat("  Genes (", length(available_cyt), "):", paste(available_cyt, collapse = ", "), "\n")
+
+mbc_data$Cytokine_SASP_score <- make_score(mbc_data, cytokine_genes)
+
+# Extended year range for this signature
+res_cyt <- fit_conditional_slopes(
+  mbc_data$Cytokine_SASP_score, "CytSASP", year_range = c(-20, 20)
+)
+cat(sprintf("  beta = %.3f, p = %.4f, N = %d\n",
+            res_cyt$beta_int, res_cyt$p_int, res_cyt$n))
+
+fig_s4d <- plot_supp_interaction(
+  res_cyt,
+  title      = "Cytokine/STAT3-SASP Signature x Menopause-Pace Interaction",
+  color_main = "#3498DB"
+)
+print(fig_s4d)
+
+
+# ============================================================================
+# 7.  FIGURE S4E — EGFR Signature Interaction
+# ============================================================================
+# 3-gene EGFR axis composite: EREG, AREG, EGFR.
+
+cat("\n========================================\n")
+cat("  Figure S4E: EGFR Interaction\n")
+cat("========================================\n")
+
+egfr_genes <- c("EREG", "AREG", "EGFR")
+available_egfr <- egfr_genes[egfr_genes %in% names(mbc_data)]
+cat("  Genes (", length(available_egfr), "):", paste(available_egfr, collapse = ", "), "\n")
+
+mbc_data$EGFR_score <- make_score(mbc_data, egfr_genes)
+res_egfr <- fit_conditional_slopes(mbc_data$EGFR_score, "EGFR")
+cat(sprintf("  beta = %.3f, p = %.4f, N = %d\n",
+            res_egfr$beta_int, res_egfr$p_int, res_egfr$n))
+
+fig_s4e <- plot_supp_interaction(
+  res_egfr,
+  title      = "EGFR Signature x Menopause-Pace Interaction",
+  color_main = "#27AE60"
+)
+print(fig_s4e)
+
+
+# ============================================================================
+# 8.  FIGURE S4F — Hub12 Leave-One-Gene-Out Stability
+# ============================================================================
+# Tests robustness of the Hub x menopause proximity interaction by
+# systematically dropping each hub gene and re-fitting the model. If the
+# interaction is driven by a single gene, removing it will substantially
+# shift the coefficient. Stable results across all leave-one-out models
+# confirm the signature is not gene-dependent.
+
+cat("\n========================================\n")
+cat("  Figure S4F: Hub12 Stability (LOGO)\n")
+cat("========================================\n")
+
+hub_genes_all <- c(
+  "AREG", "EREG", "EGF", "EGFR",
+  "IL6", "JAK1", "STAT3", "SOCS3", "IL1A", "IL1B", "CXCL8",
+  "FCGR3A", "FCGR3B", "FCGR3A.B"
+)
+available_hub <- hub_genes_all[hub_genes_all %in% names(mbc_data)]
+cat("  Available hub genes (", length(available_hub), "):",
+    paste(available_hub, collapse = ", "), "\n")
+
+#' Fit Hub interaction model for a given gene subset.
+#' @param genes_use  Character vector of gene names to include.
+#' @return One-row data.frame: beta_int, se_int, ci_low, ci_high, n.
+fit_hub_interaction <- function(genes_use) {
+  score <- make_score(mbc_data, genes_use)
+  md <- mbc_data %>%
+    mutate(
+      z_pace     = as.numeric(scale(as.numeric(pace_regpos))),
+      z_Hub      = as.numeric(scale(score)),
+      z_proximity = as.numeric(scale(as.numeric(years_to_meno_init))),
+      z_interval  = as.numeric(scale(as.numeric(years.between.biop))),
+      z_init_area = as.numeric(scale(as.numeric(init.med.lob.area2))),
+      z_init_acini = as.numeric(scale(as.numeric(init.med.lob.acini2)))
+    ) %>%
+    filter(
+      !is.na(z_pace) & !is.na(z_Hub) & !is.na(z_proximity) &
+      !is.na(z_interval) & !is.na(z_init_area) & !is.na(z_init_acini)
+    )
+
+  fit <- lm(z_pace ~ z_Hub * z_proximity + z_interval + z_init_area + z_init_acini,
+            data = md)
+  b  <- coef(fit)["z_Hub:z_proximity"]
+  se <- sqrt(vcov(fit)["z_Hub:z_proximity", "z_Hub:z_proximity"])
+
+  data.frame(beta_int = b, se_int = se,
+             ci_low = b - 1.96 * se, ci_high = b + 1.96 * se,
+             n = nrow(md))
+}
+
+# --- Full model ---
+full_res <- fit_hub_interaction(available_hub)
+full_res$gene_dropped <- "Full Hub12"
+full_res$model_type   <- "Complete Model"
+
+# --- Leave-one-out ---
+loo_results <- list(full_res)
+for (g in available_hub) {
+  res <- fit_hub_interaction(setdiff(available_hub, g))
+  res$gene_dropped <- g
+  res$model_type   <- "Leave-One-Out"
+  loo_results[[length(loo_results) + 1]] <- res
+}
+
+loo_df <- bind_rows(loo_results) %>%
+  arrange(beta_int) %>%
+  mutate(gene_dropped = factor(gene_dropped, levels = gene_dropped))
+
+cat("  Coefficient range:", round(min(loo_df$beta_int), 3), "to",
+    round(max(loo_df$beta_int), 3), "\n")
+
+# --- Forest plot ---
+fig_s4f <- ggplot(loo_df, aes(x = beta_int, y = gene_dropped, color = model_type)) +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high),
+                 height = 0.3, linewidth = 1, alpha = 0.7) +
+  geom_point(size = 4.5, alpha = 0.9, stroke = 0.5) +
+  geom_point(data = subset(loo_df, model_type == "Complete Model"),
+             size = 5.5, shape = 18, alpha = 0.95) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40",
+             linewidth = 0.7) +
+  scale_color_manual(
+    values = c("Complete Model" = "#D62828", "Leave-One-Out" = "#2E86AB"),
+    name = "Model Configuration"
+  ) +
+  labs(
+    title    = "Hub12 Gene Signature Stability Analysis",
+    subtitle = "Interaction coefficient (Hub x Proximity) for leave-one-gene-out models",
+    x        = "Interaction Coefficient (beta) with 95% CI",
+    caption  = "Diamond = complete Hub12 model; circles = individual genes excluded"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major.x = element_line(color = "grey85", linewidth = 0.3),
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.5),
+    panel.grid.minor   = element_blank(),
+    panel.background   = element_rect(fill = "white", color = NA),
+    plot.background    = element_rect(fill = "white", color = NA),
+    plot.title    = element_text(size = 18, face = "bold", hjust = 0,
+                                  margin = margin(b = 8)),
+    plot.subtitle = element_text(size = 12, color = "grey30", hjust = 0,
+                                  margin = margin(b = 20)),
+    plot.caption  = element_text(size = 10, color = "grey40", hjust = 0,
+                                  margin = margin(t = 10)),
+    axis.text.y   = element_text(size = 12, color = "grey20", face = "bold"),
+    axis.text.x   = element_text(size = 11, color = "grey20"),
+    axis.title.x  = element_text(size = 13, face = "bold",
+                                  margin = margin(t = 12), color = "grey20"),
+    axis.title.y  = element_blank(),
+    axis.line     = element_line(color = "grey60", linewidth = 0.4),
+    axis.ticks    = element_line(color = "grey60"),
+    legend.position    = "top",
+    legend.title       = element_text(size = 12, face = "bold"),
+    legend.text        = element_text(size = 11),
+    legend.background  = element_rect(fill = "white", color = NA),
+    legend.margin      = margin(b = 10),
+    plot.margin        = margin(25, 30, 20, 20)
+  )
+
+print(fig_s4f)
+
+
+# ============================================================================
+# 9.  SESSION COMPLETE
+# ============================================================================
+
+cat("\n========================================\n")
+cat("  Supplementary Figure S4 Complete\n")
+cat("========================================\n")
+cat("  Figures: S4A, S4B, S4C, S4D, S4E, S4F\n")
