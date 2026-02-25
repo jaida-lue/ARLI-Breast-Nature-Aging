@@ -25,7 +25,8 @@
 #   Fig 4H  — Pre-menopausal scatter: Hub score (z) vs Pace (z).
 #   Fig 4I  — Post-menopausal scatter: Hub score (z) vs Pace (z).
 #   Fig 4J  — Hub score x menopause proximity interaction plot.
-#   Fig 4K  — Trajectory-stratified forest plot: Hub effect sizes.
+#   Fig 4K  — Trajectory-stratified forest plot: Hub effect sizes with
+#             global interaction p-value.
 #
 # Inputs (place in DATA_DIR):
 #   Dataset A (GSEA, for 4A-B):
