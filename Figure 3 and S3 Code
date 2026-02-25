@@ -98,15 +98,6 @@ EXPECTED_N <- 14
 extract_patient_id <- function(annotation_ids) {
   # Step 1: Extract the alphanumeric block immediately after the P_ or S_ prefix
   ids <- str_extract(annotation_ids, "(?<=^[PS]_)[A-Z0-9]+")
-
-  # Step 2: Correct known truncated IDs
-  #   "CR02" should be "CR02165"; "MR93" should be "MR931544"
-  ids <- case_when(
-    ids == "CR02" ~ "CR02165",
-    ids == "MR93" ~ "MR931544",
-    TRUE          ~ ids
-  )
-
   return(ids)
 }
 
@@ -721,12 +712,11 @@ print(fig3b)
 # ----------------------------------------------------------------------------
 # These are the de-identified IDs (from the initial biopsy block column)
 # of women whose tissue was also processed for multiplex IF.
-# NOTE: These IDs correspond to internal block identifiers, not PHI.
 
 imaging_subset_ids <- c(
-  "C25337", "C23158", "C2675",  "C24103", "MR10710", "CR5634",
-  "C9606",  "M31644", "C24737", "M6930",  "C5222",   "C2089",
-  "C31183", "C26582", "M11474", "C38385"
+  "P1", "P2", "P3",  "P4", "P5", "P6",
+  "P7",  "P8", "P9", "P10",  "P11",   "P12",
+  "P13", "P14"
 )
 
 # ----------------------------------------------------------------------------
@@ -905,21 +895,21 @@ cat("\n\u2713 Figures 3A, 3B, and S3A generated successfully.\n")
 
 patient_mapping <- tibble::tribble(
   ~Initial_ID,  ~Subsequent_ID,
-  "MR97",       "CR02165",
+  "P1",       "PS1",
 
-  "C24103",     "C7694",
-  "C9606",      "MR931544",
-  "C2089",      "C34380",
-  "C26582",     "C17362",
-  "M6930",      "M3652",
-  "C2675",      "C23108",
-  "C24737",     "MR96",
-  "C23158",     "CR92",
-  "CR93",       "MR97",
-  "C25337",     "C19955",
-  "M31644",     "XR96",
-  "C5222",      "C10110",
-  "M11474",     "CR93"
+  "P2",     "PS2",
+  "P3",      "PS3",
+  "P4",      "PS4",
+  "P5",     "PS5",
+  "P6",      "PS6",
+  "P7",      "PS7",
+  "P8",     "PS8",
+  "P9",     "PS9",
+  "P10",       "PS10",
+  "P11",     "PS11",
+  "P12",     "PS12",
+  "P13",      "PS13",
+  "P14",     "PS14"
 ) %>%
   mutate(Woman_ID = paste0("W", sprintf("%02d", row_number())))
 
