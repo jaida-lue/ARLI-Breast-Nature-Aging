@@ -278,9 +278,9 @@ PMNeighborData <- read.table(
 )
 
 # Assign involution group based on Annotation ID prefix:
-#   N_ prefix = Non-Involuted (stagnant lobules)
+#   N_ prefix = Non-Involuted (noninvoluted lobules)
 #   C_ prefix = Fully Involuted (complete lobular involution)
-# Extract PatientID (e.g., "N_C12345-..." → "C12345")
+# Extract PatientID (e.g., "N_P1-..." → "P1")
 PMNeighborData <- PMNeighborData %>%
   mutate(
     Group = case_when(
@@ -318,7 +318,7 @@ PMDensity <- PM_cell_seg_summary %>%
   select(Annotation.ID, Slide.ID, Tissue.Category, Tissue.Area.mm2) %>%
   arrange(Annotation.ID, Tissue.Category)
 
-# Extract PatientID from Slide.ID (e.g., "..._C12345_..." → "C12345")
+# Extract PatientID from Slide.ID (e.g., "..._P1_..." → "P1")
 PMDensity <- PMDensity %>%
   mutate(
     PatientID = str_extract(Slide.ID, "_C([0-9]+)") %>%
